@@ -1,0 +1,32 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Node / UI
+node_modules/
+ui/node_modules/
+ui/dist/
+dist/
+
+# Tauri
+src-tauri/target/
+
+# Secrets & local artifacts (NEVER commit)
+.env
+.env.*
+*.keytab
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.p7b
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
