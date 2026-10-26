@@ -2,4 +2,4 @@
 
 pub mod db;
 
-pub use db::{Db, DbError};
+pub use db::{Db, DbError, StoredUser};

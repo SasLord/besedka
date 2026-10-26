@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use besedka_core::Room;
+use besedka_core::{Room, Role, User};
 use refinery::embed_migrations;
 use rusqlite::Connection;
 use thiserror::Error;
@@ -26,12 +26,30 @@ pub enum DbError {
     Migrations(String),
     #[error("bad room kind in db: {0}")]
     BadKind(String),
+    #[error("bad role in db: {0}")]
+    BadRole(String),
 }
 
 /// A SQLite database (connection + schema).
 #[derive(Debug)]
 pub struct Db {
     conn: Mutex<Connection>,
+}
+
+/// A user row exactly as stored — **includes the password hash**.
+///
+/// Use only inside the auth flow. To return a user to the API, map to the
+/// public [`besedka_core::User`] (via `get_user`) so the hash is never
+/// serialized.
+#[derive(Debug, Clone)]
+pub struct StoredUser {
+    pub id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub role: Role,
+    pub created_at: String,
+    /// Argon2 PHC string; `None` for AD/SSO accounts without a local password.
+    pub password_hash: Option<String>,
 }
 
 impl Db {
@@ -107,6 +125,89 @@ impl Db {
         let conn = self.conn.lock().expect("db mutex poisoned");
         Ok(conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get::<_, i64>(0))?)
     }
+
+    /// Insert a user; returns the new `id`. `password_hash` may be `None`
+    /// (AD/SSO accounts). `role` defaults to `Role::User` at the DB level if
+    /// you omit it, but we always pass it explicitly.
+    pub fn create_user(
+        &self,
+        username: &str,
+        display_name: Option<&str>,
+        role: Role,
+        password_hash: Option<&str>,
+    ) -> Result<i64, DbError> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "INSERT INTO users (username, display_name, role, password_hash)
+             VALUES (?1, ?2, ?3, ?4)",
+            (username, display_name, role.as_str(), password_hash),
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Look up a user by username (case-insensitive — `username` is
+    /// `COLLATE NOCASE`). `None` if the account does not exist.
+    pub fn find_user_by_username(&self, username: &str) -> Result<Option<StoredUser>, DbError> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, username, display_name, role, created_at, password_hash
+             FROM users WHERE username = ?1",
+        )?;
+        let mut rows = stmt.query_map([username], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        match rows.next() {
+            Some(row) => {
+                let (id, username, display_name, role, created_at, password_hash) = row?;
+                Ok(Some(StoredUser {
+                    id,
+                    username,
+                    display_name,
+                    role: role.parse().map_err(|e: String| DbError::BadRole(e))?,
+                    created_at,
+                    password_hash,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch the public view of a user (no password hash) by id.
+    pub fn get_user(&self, id: i64) -> Result<Option<User>, DbError> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, username, display_name, role, created_at FROM users WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map([id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        match rows.next() {
+            Some(row) => {
+                let (id, username, display_name, role, created_at) = row?;
+                Ok(Some(User {
+                    id,
+                    username,
+                    display_name,
+                    role: role.parse().map_err(|e: String| DbError::BadRole(e))?,
+                    created_at,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -158,5 +259,57 @@ mod tests {
         }
         let db = Db::open(&path).expect("reopen file db");
         assert_eq!(db.list_rooms().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn create_and_find_user() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .create_user("alice", Some("Alice"), Role::User, Some("$argon2id$v=19$m=65536$fake"))
+            .unwrap();
+        assert!(id > 0);
+
+        let stored = db.find_user_by_username("alice").unwrap().expect("alice exists");
+        assert_eq!(stored.id, id);
+        assert_eq!(stored.username, "alice");
+        assert_eq!(stored.role, Role::User);
+        assert_eq!(stored.display_name.as_deref(), Some("Alice"));
+        assert!(stored.password_hash.is_some());
+
+        // Lookup is case-insensitive (username is COLLATE NOCASE).
+        let upper = db.find_user_by_username("ALICE").unwrap().expect("ALICE == alice");
+        assert_eq!(upper.id, id);
+    }
+
+    #[test]
+    fn get_user_returns_public_view_without_hash() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .create_user("bob", None, Role::Manager, None)
+            .unwrap();
+        let user = db.get_user(id).unwrap().expect("bob exists");
+        assert_eq!(user.username, "bob");
+        assert_eq!(user.role, Role::Manager);
+        assert!(user.display_name.is_none());
+        // StoredUser carries the hash slot; User does not.
+        let stored = db.find_user_by_username("bob").unwrap().unwrap();
+        assert!(stored.password_hash.is_none());
+    }
+
+    #[test]
+    fn duplicate_username_rejected_case_insensitive() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_user("carol", None, Role::User, None).unwrap();
+        // Exact duplicate and case-variant duplicate both hit UNIQUE + NOCASE.
+        assert!(db.create_user("carol", None, Role::User, None).is_err());
+        assert!(db.create_user("CAROL", None, Role::User, None).is_err());
+        assert_eq!(db.user_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn find_missing_user_is_none_not_err() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.find_user_by_username("ghost").unwrap().is_none());
+        assert!(db.get_user(999).unwrap().is_none());
     }
 }
