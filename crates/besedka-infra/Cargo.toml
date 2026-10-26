@@ -1,0 +1,26 @@
+[package]
+name = "besedka-infra"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Never goes to crates.io — this is a workspace-internal crate.
+publish = false
+description = "Besedka adapters: SQLite (rusqlite + refinery), later AD/Kerberos, WS, files."
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+besedka-core = { path = "../besedka-core" }
+rusqlite = { workspace = true }
+refinery = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/besedka-core",
+    "crates/besedka-infra",
+    "crates/besedka-app",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.92"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+# Shared dependencies pinned here; member crates use `workspace = true`.
+# Versions mirror the proven stack of the trackly reference (see CONVENTIONS.md).
+[workspace.dependencies]
+# Domain / shared
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# I/O adapters (infra)
+rusqlite = { version = "0.38", features = ["bundled"] }
+refinery = { version = "0.9", features = ["rusqlite-bundled"] }
+
+# HTTP server (app)
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "macros", "ws"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-sessions = "0.15"
+time = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "fs", "net", "time"] }
+toml = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Test helpers
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+# Convention (trackly): explicit deny, keep the lists per-crate as we grow them.
+disallowed_methods = "deny"
+disallowed_types = "deny"

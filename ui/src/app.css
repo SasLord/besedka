@@ -1,0 +1,100 @@
+/* ==========================================================================
+   Besedka design tokens (Wave 0)
+   Dark/light themes as CSS variables (CORP_CHAT_PLAN.md §3).
+   Theme resolution: data-theme="light|dark" wins; otherwise the OS scheme.
+   ========================================================================== */
+
+:root {
+  /* Typography */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --text-base: 15px;
+  --text-small: 13px;
+  --text-large: 18px;
+
+  /* Spacing scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  /* Shape */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+
+  /* Light theme (default) */
+  --color-bg: #f5f6f8;
+  --color-bg-sidebar: #eceef2;
+  --color-bg-panel: #ffffff;
+  --color-text: #17181c;
+  --color-text-muted: #6b7078;
+  --color-accent: #3d7eff;
+  --color-accent-soft: #e4edff;
+  --color-border: #dfe2e7;
+  --color-bubble-in: #e9ebef;
+  --color-danger: #d64545;
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.06);
+}
+
+/* Explicit dark theme */
+:root[data-theme="dark"] {
+  --color-bg: #141519;
+  --color-bg-sidebar: #1b1d23;
+  --color-bg-panel: #21242b;
+  --color-text: #eceef2;
+  --color-text-muted: #9aa0ab;
+  --color-accent: #5b8def;
+  --color-accent-soft: #243250;
+  --color-border: #2c3038;
+  --color-bubble-in: #272b34;
+  --color-danger: #e06060;
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4);
+}
+
+/* Follow the OS unless the app pinned a theme */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-bg: #141519;
+    --color-bg-sidebar: #1b1d23;
+    --color-bg-panel: #21242b;
+    --color-text: #eceef2;
+    --color-text-muted: #9aa0ab;
+    --color-accent: #5b8def;
+    --color-accent-soft: #243250;
+    --color-border: #2c3038;
+    --color-bubble-in: #272b34;
+    --color-danger: #e06060;
+    --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4);
+  }
+}
+
+/* ==========================================================================
+   Base
+   ========================================================================== */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  color: var(--color-text);
+  background: var(--color-bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}

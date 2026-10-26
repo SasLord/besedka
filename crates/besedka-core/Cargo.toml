@@ -1,0 +1,20 @@
+[package]
+name = "besedka-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Never goes to crates.io — this is a workspace-internal crate.
+publish = false
+description = "Besedka domain: rooms, channels, roles, messages (pure types, no I/O)."
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

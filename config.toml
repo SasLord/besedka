@@ -1,0 +1,15 @@
+# Besedka server config (no secrets here — see .gitignore).
+# Env overrides: BESEDKA_HOST, BESEDKA_PORT, BESEDKA_DB_PATH, BESEDKA_CONFIG.
+
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[database]
+# SQLite file, relative to the working directory (created if missing).
+path = "data/besedka.db"
+
+[sessions]
+cookie_name = "besedka_session"
+# Session lifetime, seconds (7 days).
+session_ttl_secs = 604800

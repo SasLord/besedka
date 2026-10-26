@@ -22,6 +22,9 @@ src-tauri/target/
 *.crt
 *.p7b
 
+# Local runtime data (SQLite DB, session storage)
+data/
+
 # OS
 .DS_Store
 Thumbs.db
