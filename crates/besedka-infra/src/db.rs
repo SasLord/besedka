@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use besedka_core::{Room, Role, User};
+use besedka_core::{Role, Room, User};
 use refinery::embed_migrations;
 use rusqlite::Connection;
 use thiserror::Error;
@@ -66,14 +66,18 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Self::migrate(&mut conn)?;
         tracing::info!(db = %path.display(), "sqlite ready");
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// In-memory database with the same schema (for tests).
     pub fn open_in_memory() -> Result<Self, DbError> {
         let mut conn = Connection::open_in_memory()?;
         Self::migrate(&mut conn)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     fn migrate(conn: &mut Connection) -> Result<(), DbError> {
@@ -86,9 +90,8 @@ impl Db {
     /// All rooms, ordered by `sort_order` then `id`.
     pub fn list_rooms(&self) -> Result<Vec<Room>, DbError> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT id, kind, title, created_at FROM rooms ORDER BY sort_order, id",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id, kind, title, created_at FROM rooms ORDER BY sort_order, id")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -179,6 +182,17 @@ impl Db {
         }
     }
 
+    /// Overwrite a user's display name. Used by AD/SSO enrichment to keep the
+    /// ФИО in sync with the directory. Returns the number of rows updated (0 if
+    /// the id does not exist).
+    pub fn update_user_display_name(&self, id: i64, display_name: &str) -> Result<usize, DbError> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        Ok(conn.execute(
+            "UPDATE users SET display_name = ?2 WHERE id = ?1",
+            (id, display_name),
+        )?)
+    }
+
     /// Fetch the public view of a user (no password hash) by id.
     pub fn get_user(&self, id: i64) -> Result<Option<User>, DbError> {
         let conn = self.conn.lock().expect("db mutex poisoned");
@@ -265,11 +279,19 @@ mod tests {
     fn create_and_find_user() {
         let db = Db::open_in_memory().unwrap();
         let id = db
-            .create_user("alice", Some("Alice"), Role::User, Some("$argon2id$v=19$m=65536$fake"))
+            .create_user(
+                "alice",
+                Some("Alice"),
+                Role::User,
+                Some("$argon2id$v=19$m=65536$fake"),
+            )
             .unwrap();
         assert!(id > 0);
 
-        let stored = db.find_user_by_username("alice").unwrap().expect("alice exists");
+        let stored = db
+            .find_user_by_username("alice")
+            .unwrap()
+            .expect("alice exists");
         assert_eq!(stored.id, id);
         assert_eq!(stored.username, "alice");
         assert_eq!(stored.role, Role::User);
@@ -277,16 +299,17 @@ mod tests {
         assert!(stored.password_hash.is_some());
 
         // Lookup is case-insensitive (username is COLLATE NOCASE).
-        let upper = db.find_user_by_username("ALICE").unwrap().expect("ALICE == alice");
+        let upper = db
+            .find_user_by_username("ALICE")
+            .unwrap()
+            .expect("ALICE == alice");
         assert_eq!(upper.id, id);
     }
 
     #[test]
     fn get_user_returns_public_view_without_hash() {
         let db = Db::open_in_memory().unwrap();
-        let id = db
-            .create_user("bob", None, Role::Manager, None)
-            .unwrap();
+        let id = db.create_user("bob", None, Role::Manager, None).unwrap();
         let user = db.get_user(id).unwrap().expect("bob exists");
         assert_eq!(user.username, "bob");
         assert_eq!(user.role, Role::Manager);
@@ -304,6 +327,28 @@ mod tests {
         assert!(db.create_user("carol", None, Role::User, None).is_err());
         assert!(db.create_user("CAROL", None, Role::User, None).is_err());
         assert_eq!(db.user_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn update_display_name_updates_only_that_user() {
+        let db = Db::open_in_memory().unwrap();
+        let a = db.create_user("alice", None, Role::User, None).unwrap();
+        let b = db
+            .create_user("bob", Some("Bob"), Role::User, None)
+            .unwrap();
+
+        assert_eq!(db.update_user_display_name(a, "Алиса А.").unwrap(), 1);
+        assert_eq!(
+            db.get_user(a).unwrap().unwrap().display_name.as_deref(),
+            Some("Алиса А.")
+        );
+        // Neighbour untouched.
+        assert_eq!(
+            db.get_user(b).unwrap().unwrap().display_name.as_deref(),
+            Some("Bob")
+        );
+        // Unknown id updates nothing (no error, no phantom row).
+        assert_eq!(db.update_user_display_name(999, "Некто").unwrap(), 0);
     }
 
     #[test]

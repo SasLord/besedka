@@ -75,12 +75,20 @@ mod tests {
         let json = serde_json::to_string(&room).unwrap();
         let back: Room = serde_json::from_str(&json).unwrap();
         assert_eq!(room, back);
-        assert_eq!(json, r#"{"id":7,"kind":"channel","title":"Новости","created_at":"2026-10-26T10:00:00Z"}"#);
+        assert_eq!(
+            json,
+            r#"{"id":7,"kind":"channel","title":"Новости","created_at":"2026-10-26T10:00:00Z"}"#
+        );
     }
 
     #[test]
     fn kind_parses_and_displays() {
-        for kind in [RoomKind::General, RoomKind::Room, RoomKind::Channel, RoomKind::Direct] {
+        for kind in [
+            RoomKind::General,
+            RoomKind::Room,
+            RoomKind::Channel,
+            RoomKind::Direct,
+        ] {
             assert_eq!(kind.as_str().parse::<RoomKind>().unwrap(), kind);
         }
         assert!("bogus".parse::<RoomKind>().is_err());

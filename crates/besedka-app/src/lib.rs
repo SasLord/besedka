@@ -1,8 +1,14 @@
 //! Besedka app — composition root: config, HTTP router, wiring.
 //!
 //! Wave 0: `/api/v1/ping` + `/api/v1/rooms` over axum, sessions via
-//! `tower-sessions` (MemoryStore — enough for Wave 1's password login).
+//! `tower-sessions` (MemoryStore).
+//! Wave 1.1: local password auth (`register`/`login`/`logout`/`me`).
+//! Wave 1.2: AD/Kerberos SSO — passwordless (`GET /api/v1/auth_ad_sso`) and
+//! AD-password (`POST /api/v1/auth_ad_login`) logins, both issuing the SAME
+//! session cookie as password login, plus session-backed role gates and an
+//! admin-only AD diagnostics endpoint.
 
+pub mod ad;
 pub mod config;
 pub mod http;
 
@@ -15,20 +21,27 @@ use time::Duration;
 use tower_sessions::cookie::SameSite;
 use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
 
+use ad::AdRuntime;
 use config::SessionsConfig;
 
 /// Shared application state.
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Db>,
+    /// AD adapters + config (real or mock, chosen once at startup).
+    pub ad: Arc<AdRuntime>,
 }
 
 /// Build the HTTP application (router).
-pub fn app(db: Arc<Db>, sessions: SessionsConfig) -> Router {
-    let state = AppState { db };
+pub fn app(db: Arc<Db>, sessions: SessionsConfig, ad: AdRuntime) -> Router {
+    let state = AppState {
+        db,
+        ad: Arc::new(ad),
+    };
 
-    // Wave 1 will back this with real login; MemoryStore is enough for now
-    // (single process). Cookie: http-only, lax, non-secure for local dev.
+    // MemoryStore is enough for a single-process server (sessions are lost on
+    // restart, which is acceptable until Wave 7's deployment slice).
+    // Cookie: http-only, lax, non-secure for local dev.
     let sessions_layer = SessionManagerLayer::new(MemoryStore::default())
         .with_name(sessions.cookie_name)
         .with_http_only(true)
@@ -46,6 +59,15 @@ pub fn app(db: Arc<Db>, sessions: SessionsConfig) -> Router {
         .route("/api/v1/login", post(http::login))
         .route("/api/v1/logout", post(http::logout))
         .route("/api/v1/me", get(http::me))
+        // Wave 1.2 — AD/Kerberos SSO.
+        .route("/api/v1/auth_ad_sso", get(http::sso::ad_sso))
+        .route(
+            "/api/v1/auth_ad_sso/status",
+            get(http::sso::ad_feature_status),
+        )
+        .route("/api/v1/auth_ad_login", post(http::sso::ad_login))
+        // Admin-only (403 for non-admins).
+        .route("/api/v1/admin/ad_status", get(http::sso::admin_ad_status))
         .layer(sessions_layer)
         .with_state(state)
 }
@@ -55,14 +77,52 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use besedka_core::RoomKind;
+    use besedka_infra::ad::AdConfig;
     use tower::ServiceExt;
 
     fn test_db() -> Arc<Db> {
         Arc::new(Db::open_in_memory().expect("in-memory db"))
     }
 
+    /// AD off (the default) — every SSO route answers 503.
     fn test_app(db: Arc<Db>) -> Router {
-        app(db, SessionsConfig::default())
+        app(
+            db,
+            SessionsConfig::default(),
+            AdRuntime::build(AdConfig::default(), true),
+        )
+    }
+
+    /// AD on in mock mode: fixtures, no DC, no keytab.
+    fn mock_ad() -> AdConfig {
+        AdConfig {
+            enabled: true,
+            mock: true,
+            domain: "example.local".to_string(),
+            ..AdConfig::default()
+        }
+    }
+
+    fn mock_app(db: Arc<Db>) -> Router {
+        app(
+            db,
+            SessionsConfig::default(),
+            AdRuntime::build(mock_ad(), true),
+        )
+    }
+
+    /// AD on in REAL mode with a keytab path — a DC is never contacted by the
+    /// code paths under test (challenge / keytab read / ticket validation are
+    /// all local).
+    fn real_app(db: Arc<Db>, keytab_path: &str) -> Router {
+        let cfg = AdConfig {
+            enabled: true,
+            domain: "example.local".to_string(),
+            spn: "HTTP/chat.example.local".to_string(),
+            keytab_path: keytab_path.to_string(),
+            ..AdConfig::default()
+        };
+        app(db, SessionsConfig::default(), AdRuntime::build(cfg, false))
     }
 
     async fn get(router: Router, uri: &str) -> (u16, serde_json::Value) {
@@ -72,7 +132,9 @@ mod tests {
             .expect("valid request");
         let response = router.oneshot(request).await.expect("handler ok");
         let status = response.status().as_u16();
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         (status, value)
     }
@@ -87,9 +149,25 @@ mod tests {
         body: Option<serde_json::Value>,
         cookie: Option<&str>,
     ) -> (u16, serde_json::Value, axum::http::HeaderMap) {
+        req_h(router, method, uri, body, cookie, &[]).await
+    }
+
+    /// Same as [`req`], plus extra request headers (AD login hints,
+    /// `Authorization: Negotiate …`).
+    async fn req_h(
+        router: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+        cookie: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> (u16, serde_json::Value, axum::http::HeaderMap) {
         let mut builder = axum::http::Request::builder().method(method).uri(uri);
         if let Some(cookie) = cookie {
             builder = builder.header(axum::http::header::COOKIE, cookie);
+        }
+        for (name, value) in extra {
+            builder = builder.header(*name, *value);
         }
         let (body, builder) = match body {
             Some(v) => (
@@ -102,7 +180,9 @@ mod tests {
         let response = router.clone().oneshot(request).await.expect("handler ok");
         let status = response.status().as_u16();
         let headers = response.headers().clone();
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         (status, value, headers)
     }
@@ -135,6 +215,32 @@ mod tests {
         .await
     }
 
+    /// A valid keytab blob for `HTTP/web.example.local@EXAMPLE.LOCAL`
+    /// (AES256, kvno 3) — same byte layout the keytab unit tests build.
+    fn sample_keytab() -> Vec<u8> {
+        fn counted(s: &[u8]) -> Vec<u8> {
+            let mut v = (s.len() as u16).to_be_bytes().to_vec();
+            v.extend_from_slice(s);
+            v
+        }
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&counted(b"EXAMPLE.LOCAL"));
+        body.extend_from_slice(&counted(b"HTTP"));
+        body.extend_from_slice(&counted(b"web.example.local"));
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.push(3u8);
+        body.extend_from_slice(&18u16.to_be_bytes());
+        body.extend_from_slice(&counted(&[0xABu8; 32]));
+        body.extend_from_slice(&3u32.to_be_bytes());
+
+        let mut out = 0x0502u16.to_be_bytes().to_vec();
+        out.extend_from_slice(&(body.len() as i32).to_be_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
     #[tokio::test]
     async fn ping_returns_ok_json() {
         let (status, body) = get(test_app(test_db()), "/api/v1/ping").await;
@@ -154,7 +260,8 @@ mod tests {
     #[tokio::test]
     async fn rooms_lists_created_room() {
         let db = test_db();
-        db.create_room(RoomKind::General, "Новости").expect("create room");
+        db.create_room(RoomKind::General, "Новости")
+            .expect("create room");
         let (status, body) = get(test_app(db), "/api/v1/rooms").await;
         assert_eq!(status, 200);
         let rooms = body["rooms"].as_array().expect("rooms array");
@@ -168,12 +275,14 @@ mod tests {
     #[tokio::test]
     async fn register_creates_account_without_leaking_hash() {
         let router = test_app(test_db());
-        let (status, body, _) =
-            register(&router, "alice", "sup3rs3cret").await;
+        let (status, body, _) = register(&router, "alice", "sup3rs3cret").await;
         assert_eq!(status, 201);
         assert_eq!(body["user"]["username"], "alice");
         assert_eq!(body["user"]["role"], "user");
-        assert!(body["user"].get("password_hash").is_none(), "hash must not leak");
+        assert!(
+            body["user"].get("password_hash").is_none(),
+            "hash must not leak"
+        );
     }
 
     #[tokio::test]
@@ -290,5 +399,349 @@ mod tests {
         // me with the old cookie → 401 (session emptied + deleted).
         let (status, _, _) = req(&router, "GET", "/api/v1/me", None, Some(&cookie)).await;
         assert_eq!(status, 401);
+    }
+
+    // ----- Wave 1.2: AD/Kerberos SSO (mock mode) -----
+
+    #[tokio::test]
+    async fn sso_status_is_public_and_reports_ad_off_by_default() {
+        let (status, body) = get(test_app(test_db()), "/api/v1/auth_ad_sso/status").await;
+        assert_eq!(status, 200, "status probe must never need a session");
+        assert_eq!(body["enabled"], false);
+        assert_eq!(body["sso"], false);
+        assert_eq!(body["password_login"], false);
+    }
+
+    #[tokio::test]
+    async fn sso_status_reports_mock_mode() {
+        let (status, body) = get(mock_app(test_db()), "/api/v1/auth_ad_sso/status").await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["mock"], true);
+        assert_eq!(body["sso"], true);
+        assert_eq!(body["password_login"], true);
+    }
+
+    #[tokio::test]
+    async fn sso_endpoint_is_503_when_ad_is_disabled() {
+        let (status, body) = get(test_app(test_db()), "/api/v1/auth_ad_sso").await;
+        assert_eq!(status, 503);
+        assert!(body["error"].as_str().unwrap().contains("disabled"));
+    }
+
+    #[tokio::test]
+    async fn sso_mock_logs_in_fixture_user_and_opens_a_session() {
+        let router = mock_app(test_db());
+
+        // GET with no ticket at all — in mock mode that IS the login.
+        let (status, body, headers) = req(&router, "GET", "/api/v1/auth_ad_sso", None, None).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["mock"], true);
+        assert_eq!(body["user"]["username"], "us100");
+        // Role and ФИО come from the mocked AD directory, not from the login.
+        assert_eq!(body["user"]["role"], "manager");
+        assert_eq!(body["user"]["display_name"], "Иванов Иван Иванович");
+        assert!(
+            body["user"].get("password_hash").is_none(),
+            "AD accounts never expose a hash"
+        );
+
+        // The SAME session cookie as password login works for /me.
+        let cookie = session_cookie(&headers);
+        let (status, body, _) = req(&router, "GET", "/api/v1/me", None, Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["user"]["username"], "us100");
+    }
+
+    #[tokio::test]
+    async fn sso_mock_identity_can_be_chosen_by_header_or_query() {
+        let router = mock_app(test_db());
+
+        let (status, body, _) = req_h(
+            &router,
+            "GET",
+            "/api/v1/auth_ad_sso",
+            None,
+            None,
+            &[("x-besedka-ad-login", "us200")],
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["user"]["username"], "us200");
+        assert_eq!(body["user"]["role"], "user");
+
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            "/api/v1/auth_ad_sso?login=us300",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["user"]["username"], "us300");
+        assert_eq!(body["user"]["role"], "admin");
+    }
+
+    #[tokio::test]
+    async fn sso_mock_second_login_reuses_the_same_account() {
+        let db = test_db();
+        let router = mock_app(db.clone());
+
+        let (_, first, _) = req(&router, "GET", "/api/v1/auth_ad_sso", None, None).await;
+        let (_, second, _) = req(&router, "GET", "/api/v1/auth_ad_sso", None, None).await;
+
+        assert_eq!(first["user"]["id"], second["user"]["id"]);
+        assert_eq!(db.user_count().expect("count"), 1, "no duplicate accounts");
+    }
+
+    #[tokio::test]
+    async fn sso_mock_keeps_an_existing_local_role_and_syncs_the_display_name() {
+        let db = test_db();
+        let router = mock_app(db.clone());
+
+        // A local password account already uses the same username.
+        let (status, registered, _) = register(&router, "us100", "sup3rs3cret").await;
+        assert_eq!(status, 201);
+        let local_id = registered["user"]["id"].clone();
+        assert_eq!(registered["user"]["role"], "user");
+
+        let (status, body, _) = req(&router, "GET", "/api/v1/auth_ad_sso", None, None).await;
+        assert_eq!(status, 200);
+        // Same account (username is the identity), role NOT silently elevated,
+        // ФИО refreshed from the directory.
+        assert_eq!(body["user"]["id"], local_id);
+        assert_eq!(body["user"]["role"], "user");
+        assert_eq!(body["user"]["display_name"], "Иванов Иван Иванович");
+    }
+
+    #[tokio::test]
+    async fn sso_mock_denied_identity_is_401() {
+        let router = mock_app(test_db());
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            "/api/v1/auth_ad_sso?login=deny-me",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, 401);
+        assert!(!body["error"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sso_mock_unreachable_directory_is_503_and_creates_nothing() {
+        // AD on, mock adapters, but the directory reports an outage.
+        let db = test_db();
+        let cfg = mock_ad();
+        let ad = AdRuntime {
+            config: cfg.clone(),
+            mock: true,
+            client: Arc::new(besedka_infra::ad::MockAdClient::default_fixtures()),
+            directory: Arc::new(besedka_infra::ad::MockAdDirectory::unreachable()),
+        };
+        let router = app(db.clone(), SessionsConfig::default(), ad);
+
+        let (status, _body, _) = req(&router, "GET", "/api/v1/auth_ad_sso", None, None).await;
+        assert_eq!(status, 503, "an AD outage must not mint a session");
+        assert_eq!(db.user_count().expect("count"), 0);
+    }
+
+    // ----- Wave 1.2: real Kerberos path (no DC needed) -----
+
+    #[tokio::test]
+    async fn sso_real_mode_challenges_with_negotiate_header() {
+        let router = real_app(test_db(), "/nonexistent/chat.keytab");
+        let (status, _body, headers) = req(&router, "GET", "/api/v1/auth_ad_sso", None, None).await;
+
+        assert_eq!(status, 401);
+        assert_eq!(
+            headers
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .expect("WWW-Authenticate")
+                .to_str()
+                .unwrap(),
+            "Negotiate",
+            "a domain-joined browser retries with a ticket only if we challenge"
+        );
+    }
+
+    #[tokio::test]
+    async fn sso_real_mode_unreadable_keytab_is_503() {
+        let router = real_app(test_db(), "/nonexistent/chat.keytab");
+        // "dGlja2V0" = base64("ticket")
+        let (status, body, _) = req_h(
+            &router,
+            "GET",
+            "/api/v1/auth_ad_sso",
+            None,
+            None,
+            &[("authorization", "Negotiate dGlja2V0")],
+        )
+        .await;
+        assert_eq!(status, 503);
+        assert!(body["error"].as_str().unwrap().contains("keytab"));
+    }
+
+    #[tokio::test]
+    async fn sso_real_mode_malformed_token_is_400() {
+        let router = real_app(test_db(), "/nonexistent/chat.keytab");
+        let (status, _body, _) = req_h(
+            &router,
+            "GET",
+            "/api/v1/auth_ad_sso",
+            None,
+            None,
+            &[("authorization", "Negotiate not base64 !!!")],
+        )
+        .await;
+        assert_eq!(status, 400);
+    }
+
+    #[tokio::test]
+    async fn sso_real_mode_foreign_ticket_is_401_and_never_leaks_internals() {
+        // A real (structurally valid) keytab for a DIFFERENT SPN than the one
+        // the token claims: the accept fails, and the client gets a generic 401.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("chat.keytab");
+        std::fs::write(&path, sample_keytab()).expect("write keytab");
+
+        let router = real_app(test_db(), path.to_str().expect("utf8 path"));
+        let (status, body, _) = req_h(
+            &router,
+            "GET",
+            "/api/v1/auth_ad_sso",
+            None,
+            None,
+            &[("authorization", "Negotiate dGlja2V0")],
+        )
+        .await;
+
+        assert_eq!(status, 401);
+        let message = body["error"].as_str().unwrap();
+        assert!(
+            !message.to_lowercase().contains("keytab"),
+            "internals must not leak to the client: {message}"
+        );
+        assert!(message.contains("Kerberos"));
+    }
+
+    // ----- Wave 1.2: AD password login (LDAP bind, mock fixtures) -----
+
+    #[tokio::test]
+    async fn ad_password_login_succeeds_with_mock_fixture() {
+        let router = mock_app(test_db());
+        let (status, body, headers) = req(
+            &router,
+            "POST",
+            "/api/v1/auth_ad_login",
+            Some(serde_json::json!({ "username": "us200@example.local", "password": "Secret123" })),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        assert_eq!(body["user"]["username"], "us200");
+        assert_eq!(body["user"]["display_name"], "Петрова Анна Сергеевна");
+
+        let cookie = session_cookie(&headers);
+        let (status, body, _) = req(&router, "GET", "/api/v1/me", None, Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["user"]["username"], "us200");
+    }
+
+    #[tokio::test]
+    async fn ad_password_login_wrong_password_is_401_with_generic_message() {
+        let router = mock_app(test_db());
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            "/api/v1/auth_ad_login",
+            Some(serde_json::json!({ "username": "us100", "password": "nope-nope-1" })),
+            None,
+        )
+        .await;
+        assert_eq!(status, 401);
+        assert_eq!(body["error"], "invalid username or password");
+    }
+
+    #[tokio::test]
+    async fn ad_password_login_is_503_when_ad_is_off() {
+        let router = test_app(test_db());
+        let (status, _body, _) = req(
+            &router,
+            "POST",
+            "/api/v1/auth_ad_login",
+            Some(serde_json::json!({ "username": "us100", "password": "Passw0rd!" })),
+            None,
+        )
+        .await;
+        assert_eq!(status, 503);
+    }
+
+    // ----- Wave 1.2: role gates -----
+
+    #[tokio::test]
+    async fn admin_endpoint_requires_authentication() {
+        let router = mock_app(test_db());
+        let (status, body, _) = req(&router, "GET", "/api/v1/admin/ad_status", None, None).await;
+        assert_eq!(status, 401);
+        assert_eq!(body["error"], "not logged in");
+    }
+
+    #[tokio::test]
+    async fn admin_endpoint_forbids_non_admin_and_allows_admin() {
+        let router = mock_app(test_db());
+
+        // us100 maps to manager — authenticated but not allowed.
+        let (_, _, headers) = req_h(
+            &router,
+            "GET",
+            "/api/v1/auth_ad_sso?login=us100",
+            None,
+            None,
+            &[],
+        )
+        .await;
+        let manager_cookie = session_cookie(&headers);
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            "/api/v1/admin/ad_status",
+            None,
+            Some(&manager_cookie),
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert!(body["error"].as_str().unwrap().contains("admin"));
+
+        // us300 maps to admin — allowed, and the payload carries no secrets.
+        let (_, _, headers) = req(
+            &router,
+            "GET",
+            "/api/v1/auth_ad_sso?login=us300",
+            None,
+            None,
+        )
+        .await;
+        let admin_cookie = session_cookie(&headers);
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            "/api/v1/admin/ad_status",
+            None,
+            Some(&admin_cookie),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["mock"], true);
+        assert_eq!(body["reachable"], "ok");
+        assert_eq!(body["directory_configured"], false);
+        assert!(
+            body.get("bind_password").is_none(),
+            "diagnostics must never expose the service password"
+        );
     }
 }

@@ -2,6 +2,7 @@
 //!
 //! No secrets here (see `.gitignore`): auth secrets live in the environment.
 
+use besedka_infra::ad::AdConfig;
 use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -48,10 +49,7 @@ impl Default for ServerConfig {
 impl ServerConfig {
     /// Address to bind. Wave 0: IPv4 only (a hostname needs name resolution).
     pub fn socket_addr(&self) -> SocketAddr {
-        let ip: IpAddr = self
-            .host
-            .parse()
-            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let ip: IpAddr = self.host.parse().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
         SocketAddr::new(ip, self.port)
     }
 }
@@ -96,6 +94,9 @@ pub struct Config {
     pub database: DatabaseConfig,
     #[serde(default)]
     pub sessions: SessionsConfig,
+    /// AD/Kerberos SSO (off unless `[ad] enabled = true`).
+    #[serde(default)]
+    pub ad: AdConfig,
 }
 
 #[derive(Debug, Error)]
@@ -110,7 +111,9 @@ pub enum ConfigError {
 
 impl Config {
     /// Load config from a TOML file, then apply env overrides:
-    /// `BESEDKA_HOST`, `BESEDKA_PORT`, `BESEDKA_DB_PATH`.
+    /// `BESEDKA_HOST`, `BESEDKA_PORT`, `BESEDKA_DB_PATH`, plus the AD ones
+    /// (`BESEDKA_AD_*`). Credentials only ever come from the environment —
+    /// `BESEDKA_AD_BIND_PASSWORD` is never written to a TOML.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let raw = std::fs::read_to_string(path.as_ref())?;
         let mut cfg: Config =
@@ -127,8 +130,45 @@ impl Config {
         if let Ok(db_path) = std::env::var("BESEDKA_DB_PATH") {
             cfg.database.path = db_path;
         }
+        apply_ad_env(&mut cfg.ad);
         Ok(cfg)
     }
+}
+
+/// Overlay `BESEDKA_AD_*` env vars onto the `[ad]` section.
+///
+/// Empty values are ignored, so a blank CI variable cannot silently disable a
+/// working config.
+fn apply_ad_env(ad: &mut AdConfig) {
+    fn set(target: &mut String, var: &str) {
+        if let Ok(value) = std::env::var(var) {
+            if !value.trim().is_empty() {
+                *target = value;
+            }
+        }
+    }
+    set(&mut ad.domain, "BESEDKA_AD_DOMAIN");
+    set(&mut ad.spn, "BESEDKA_AD_SPN");
+    set(&mut ad.keytab_path, "BESEDKA_AD_KEYTAB");
+    set(&mut ad.host, "BESEDKA_AD_HOST");
+    set(&mut ad.base_dn, "BESEDKA_AD_BASE_DN");
+    set(&mut ad.bind_dn, "BESEDKA_AD_BIND_DN");
+    // The one secret: environment only.
+    set(&mut ad.bind_password, "BESEDKA_AD_BIND_PASSWORD");
+    if let Ok(enabled) = std::env::var("BESEDKA_AD_ENABLED") {
+        ad.enabled = truthy(&enabled);
+    }
+    if let Ok(mock) = std::env::var("BESEDKA_AD_MOCK") {
+        ad.mock = truthy(&mock);
+    }
+}
+
+/// `1`/`true`/`yes`/`on` (case-insensitive) ⇒ true; anything else ⇒ false.
+fn truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[cfg(test)]
@@ -167,5 +207,76 @@ mod tests {
     fn empty_file_gives_defaults() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.server.port, 8080);
+    }
+
+    #[test]
+    fn ad_section_is_optional_and_off_by_default() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(!cfg.ad.enabled, "AD must default to off");
+        assert!(!cfg.ad.mock);
+    }
+
+    #[test]
+    fn ad_section_parses_with_mock_mode() {
+        let toml = r#"
+            [ad]
+            enabled = true
+            mock = true
+            domain = "example.local"
+            spn = "HTTP/chat.example.local"
+            [[ad.role_mapping]]
+            group_dn = "CN=Besedka-Admins,OU=Groups,DC=example,DC=local"
+            role = "admin"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.ad.enabled && cfg.ad.mock);
+        assert_eq!(cfg.ad.domain, "example.local");
+        assert_eq!(cfg.ad.role_mapping.len(), 1);
+        assert_eq!(cfg.ad.role_mapping[0].role, "admin");
+    }
+
+    #[test]
+    fn truthy_flag_parsing() {
+        for v in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(truthy(v), "{v} should be truthy");
+        }
+        for v in ["0", "false", "no", "", "maybe"] {
+            assert!(!truthy(v), "{v} should be falsy");
+        }
+    }
+
+    #[test]
+    fn ad_env_overrides_fill_the_section() {
+        // Saved/restored so this test never leaks state into its neighbours.
+        let vars = [
+            ("BESEDKA_AD_DOMAIN", "corp.example"),
+            ("BESEDKA_AD_HOST", "dc1.corp.example"),
+            ("BESEDKA_AD_BIND_DN", "svc-besedka-ro@corp.example"),
+            ("BESEDKA_AD_BIND_PASSWORD", "env-only-secret"),
+            ("BESEDKA_AD_MOCK", "1"),
+        ];
+        let saved: Vec<_> = vars
+            .iter()
+            .map(|(k, _)| (*k, std::env::var(k).ok()))
+            .collect();
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+
+        let mut ad = AdConfig::default();
+        apply_ad_env(&mut ad);
+
+        assert_eq!(ad.domain, "corp.example");
+        assert_eq!(ad.host, "dc1.corp.example");
+        assert_eq!(ad.bind_dn, "svc-besedka-ro@corp.example");
+        assert_eq!(ad.bind_password, "env-only-secret");
+        assert!(ad.mock);
+
+        for (k, old) in saved {
+            match old {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 }

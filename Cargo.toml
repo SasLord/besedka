@@ -24,16 +24,27 @@ argon2 = "0.5"
 # unifies with the copy of password-hash that argon2 already depends on.
 password-hash = { version = "0.5", features = ["getrandom"] }
 
+# Purely-async trait objects (`dyn AdClient`, `dyn AdDirectory`) — ports only.
+async-trait = "0.1"
+
 # I/O adapters (infra)
 rusqlite = { version = "0.38", features = ["bundled"] }
 refinery = { version = "0.9", features = ["rusqlite-bundled"] }
+# AD/Kerberos (ported from trackly, same pins). `sspi` with default-features
+# off drops the aws-lc-rs C-crypto TLS provider (only needed for the unused
+# `network_client` path) — the acceptor decrypts service tickets offline.
+sspi = { version = "0.21", default-features = false }
+ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
+hickory-resolver = "0.26.1"
 
 # HTTP server (app)
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "macros", "ws"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "macros", "ws", "query"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 tower-sessions = "0.15"
 time = "0.3"
+# base64 for the `Negotiate <token>` Authorization header payloads.
+base64 = "0.22"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "fs", "net", "time"] }
 toml = "0.8"
 anyhow = "1"

@@ -16,11 +16,20 @@ workspace = true
 
 [dependencies]
 besedka-core = { path = "../besedka-core" }
+async-trait = { workspace = true }
 rusqlite = { workspace = true }
 refinery = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# AD/Kerberos adapters (ported from trackly). `ldap3` needs a tokio runtime
+# for its connection driver task (`ldap3::drive!`).
+sspi = { workspace = true }
+ldap3 = { workspace = true }
+hickory-resolver = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Parsing `[ad]` sections in the config unit tests.
+toml = { workspace = true }

@@ -5,7 +5,7 @@
 //! uses the parameters embedded in the stored hash, not the current defaults.
 
 use argon2::password_hash::{
-    PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
 use argon2::Argon2;
 
@@ -24,7 +24,9 @@ pub fn verify(password: &str, hash: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(hash) else {
         return false;
     };
-    Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
 }
 
 #[cfg(test)]

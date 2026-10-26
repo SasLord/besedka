@@ -2,7 +2,11 @@
 //!
 //! Wave 0: `ping`, `rooms`. Wave 1.1: `register`, `login`, `logout`, `me` —
 //! local password auth over `tower_sessions` (in-memory store, cookie session;
-//! see lib.rs for the wiring and the SSO note).
+//! see lib.rs for the wiring). Wave 1.2: AD/Kerberos SSO ([`sso`]) and the
+//! session-backed role gates ([`extract`]).
+
+pub mod extract;
+pub mod sso;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -17,7 +21,8 @@ use tower_sessions::Session;
 use crate::AppState;
 
 /// Key under which the authenticated user's id is stored in the session.
-const SESSION_USER_ID: &str = "user_id";
+/// Shared by password login, both AD login paths and the role-gate extractors.
+pub(crate) const SESSION_USER_ID: &str = "user_id";
 
 // ----- Error type -----
 
@@ -30,23 +35,28 @@ pub struct HttpError {
 }
 
 impl HttpError {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
         }
     }
-    fn bad_request(message: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
-    fn unauthorized(message: impl Into<String>) -> Self {
+    pub(crate) fn unauthorized(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNAUTHORIZED, message)
     }
-    fn conflict(message: impl Into<String>) -> Self {
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, message)
     }
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
+    /// "The feature exists but cannot serve this request right now" — used by
+    /// the AD endpoints when AD is off, unconfigured or unreachable.
+    pub(crate) fn service_unavailable(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, message)
     }
 }
 
