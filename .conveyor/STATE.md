@@ -20,7 +20,8 @@ _Обновлено: 2026-10-27 · Source of truth «где мы»._
 | Код | ✅ воркспейс из 3 кристов + UI (Svelte 5) |
 | **Wave 1.1 (auth: register/login/logout/me)** | ✅ **DONE** (2026-10-26, 31 tests зелёные) |
 | **Wave 1.2 (AD/Kerberos SSO + mock)** | ✅ **DONE** (2026-10-27, 137 tests зелёные, clippy 0 deny) |
-| **Wave 1 (аутентификация + комнаты)** | 🟡 **ЧАСТИЧНО** — 1.1 ✅, 1.2 ✅, 1.3 ⬜ |
+| **Wave 1.3 (список комнат + join/leave + роли)** | ✅ **DONE** (2026-10-27, 148 tests, clippy 0, svelte-check 0, UI в браузере) |
+| **Wave 1 (аутентификация + комнаты)** | ✅ **ПОЛНОСТЬЮ ЗАВЕРШЕНА** (2026-10-27, коммит `e5340ce`, pushed) |
 
 ## Wave 0 — что сделано (принято)
 - Cargo-воркспейс: `besedka-core` (типы users/roles/rooms) · `besedka-infra` (rusqlite bundled + refinery) · `besedka-app` (axum + бинарник).
@@ -49,11 +50,24 @@ _Обновлено: 2026-10-27 · Source of truth «где мы»._
 - **Гейты:** `cargo build` OK · `cargo test` — **137 passed** (50 app, 11 core, 76 infra; +37 новых AD-тестов, включая real-путь без DC: challenge/Negotiate, keytab, чужой билет → 401) · `cargo clippy --all-targets -- -D warnings` — **0** · `cargo fmt --check` чистый · сервер поднят, эндпоинты отвечают (см. выше).
 - **Осталось непроверенным (осознанно):** живой Kerberos-handshake — только на реальном DC (`sspi` accept build-verified, как в trackly); живой LDAPS/группы — при наличии DC.
 
+## Wave 1.3 — что сделано (принято)
+- **Миграция:** `migrations/V3__rooms_membership.sql` — `room_members(room_id, user_id, joined_at)`, FK `ON DELETE CASCADE`, `UNIQUE(room_id, user_id)`, индекс по `user_id`.
+- **API (besedka-app):** `POST /api/v1/rooms/{id}/join` (AuthedUser; 404 если комнаты нет; **идемпотентно** — повторный join = ок) · `POST /api/v1/rooms/{id}/leave` (AuthedUser; 404 если комнаты нет или юзер не был в ней) · `GET /api/v1/rooms` (AuthedUser) — теперь в каждой комнате `joined: bool` + `member_count`.
+- **besedka-infra:** `Db::list_rooms_for_user` / `room_view` / `join_room` / `leave_room` (SQL в одном месте) · `RoomView { room, joined, member_count }` (db.rs) + JSON-обёртка `RoomViewResponse` (http/mod.rs).
+- **Ролевые гейты:** join/leave — любой `AuthedUser` (401 без сессии); управление комнатами — `AdminUser` (403 для не-админа); в UI админ-секция видна только admin.
+- **UI (Svelte 5):** сайдбар со списком комнат + бейджи вида (GENERAL/ROOM/CHANNEL/DIRECT), отметка «вы здесь» у `joined:true`, счётчик участников, кнопки **Join/Leave** (состояние обновляется после клика); шапка с юзером + бейджем роли (ADMIN/MANAGER) + «Выйти»; empty-state «вы не в комнатах»; экран входа: «Войти через AD» (видна когда `auth_ad_sso/status` enabled) + выбор mock-пользователя (us100 manager / us200 user / us300 admin) + парольный login/register (1.1).
+- **SSO-вход в UI:** `fetch` к `GET /api/v1/auth_ad_sso` (эндпоинт отвечает JSON `{ok, mock, user}` + сессию-кукку и в mock, и в real-режиме; браузер прозрачно доводит Negotiate) — без full-page-навигации.
+- **Гейты:** `cargo build` OK · `cargo test` — **148 passed** (58 app, 11 core, 79 infra; новые HTTP-тесты: join → joined=true, double-join ok, leave → joined=false, leave без join = 404, чужая комната = 404) · `cargo clippy --all-targets -- -D warnings` — **0** · `npm run check` (svelte-check) — **0 errors** · `npm run build` (vite) — OK · рендер проверен в браузере: login us300 (admin, ADMIN-бейдж + админ-секция) и us100 (manager), список комнат, Join → «вы здесь» + счётчик 1 → Leave → сброс (скриншот `.conveyor/screenshots/wave13-rooms.png`).
+- **Демо-данные:** dev-БД `data/besedka.db` — 3 комнаты (Общий/Работа/Новости) вставлены вручную (V1 без сида).
+- **Commit:** `e5340ce` — `feat(rooms): Wave 1.3 — room list + join/leave + role gates (app+ui)`, pushed в origin/main.
+
 ## Дальше
-**WAVE 1 — аутентификация + комнаты** (PLAN.md §Wave 1):
-1. **1.1 ✅ DONE** register/login/logout/me (argon2) + сессии + `users`/`roles` в core.
-2. **1.2 ✅ DONE** AD/Kerberos SSO (`GET /auth_ad_sso`, `POST /auth_ad_login`, status, admin-диагностика) + mock-режим + ролевые гейты.
-3. **1.3 🟡** UI: список комнат + join/leave + ролевые гейты — локальная 27B. Точка входа в UI: `GET /api/v1/auth_ad_sso/status` (показать/скрыть кнопку «Войти через AD»), затем `GET /api/v1/auth_ad_sso` (редирект-вход).
+**WAVE 1 (аутентификация + комнаты) — ✅ ПОЛНОСТЬЮ ЗАВЕРШЕНА** (2026-10-27):
+1. **1.1 ✅** register/login/logout/me (argon2) + сессии + `users`/`roles` в core.
+2. **1.2 ✅** AD/Kerberos SSO (`GET /auth_ad_sso`, `POST /auth_ad_login`, status, admin-диагностика) + mock-режим + ролевые гейты.
+3. **1.3 ✅** список комнат + join/leave + ролевые гейты (app + ui).
+
+**Дальше — Wave 2 (сообщения):** см. `PLAN.md` — история сообщений в комнате, отправка/получение, базовые события.
 
 ## Указатели контекста
 - Конвенции/стек/роли: `CONVENTIONS.md`
