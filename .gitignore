@@ -33,3 +33,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Stray root-level DB (real one is under data/)
+*.db

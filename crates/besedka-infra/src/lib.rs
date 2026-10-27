@@ -5,4 +5,4 @@
 pub mod ad;
 pub mod db;
 
-pub use db::{Db, DbError, StoredUser};
+pub use db::{Db, DbError, RoomView, StoredUser};

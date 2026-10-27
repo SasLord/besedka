@@ -55,6 +55,8 @@ pub fn app(db: Arc<Db>, sessions: SessionsConfig, ad: AdRuntime) -> Router {
     Router::new()
         .route("/api/v1/ping", get(http::ping))
         .route("/api/v1/rooms", get(http::rooms))
+        .route("/api/v1/rooms/{id}/join", post(http::join_room))
+        .route("/api/v1/rooms/{id}/leave", post(http::leave_room))
         .route("/api/v1/register", post(http::register))
         .route("/api/v1/login", post(http::login))
         .route("/api/v1/logout", post(http::logout))
@@ -743,5 +745,210 @@ mod tests {
             body.get("bind_password").is_none(),
             "diagnostics must never expose the service password"
         );
+    }
+
+    // ----- Wave 1.3: room join/leave + membership -----
+
+    /// Register a local account, log in, and hand back the session cookie.
+    async fn logged_in(router: &Router, username: &str) -> String {
+        register(router, username, "sup3rs3cret").await;
+        let (_, _, headers) = req(
+            router,
+            "POST",
+            "/api/v1/login",
+            Some(serde_json::json!({ "username": username, "password": "sup3rs3cret" })),
+            None,
+        )
+        .await;
+        session_cookie(&headers)
+    }
+
+    #[tokio::test]
+    async fn join_marks_the_room_and_the_list_reflects_it() {
+        let db = test_db();
+        let room_id = db.create_room(RoomKind::General, "Новости").expect("create room");
+        let router = test_app(db);
+        let cookie = logged_in(&router, "alice").await;
+
+        // Before joining: the room is listed but `joined` is false.
+        let (status, body, _) = req(&router, "GET", "/api/v1/rooms", None, Some(&cookie)).await;
+        assert_eq!(status, 200);
+        let room = &body["rooms"][0];
+        assert_eq!(room["joined"], false);
+        assert_eq!(room["member_count"], 0);
+
+        // Join → 200, `joined` true, member_count 1.
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/join"),
+            None,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["room"]["id"], room_id);
+        assert_eq!(body["room"]["joined"], true);
+        assert_eq!(body["room"]["member_count"], 1);
+
+        // The list now shows membership for alice...
+        let (status, body, _) = req(&router, "GET", "/api/v1/rooms", None, Some(&cookie)).await;
+        assert_eq!(status, 200);
+        let room = &body["rooms"][0];
+        assert_eq!(room["joined"], true);
+        assert_eq!(room["member_count"], 1);
+
+        // ...but not for anonymous viewers.
+        let (status, body, _) = req(&router, "GET", "/api/v1/rooms", None, None).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["rooms"][0]["joined"], false);
+    }
+
+    #[tokio::test]
+    async fn double_join_is_idempotent() {
+        let db = test_db();
+        let room_id = db.create_room(RoomKind::General, "Общий").expect("create room");
+        let router = test_app(db);
+        let cookie = logged_in(&router, "alice").await;
+
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/join"),
+            None,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["room"]["member_count"], 1);
+
+        // Second join: still 200, count stays at 1.
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/join"),
+            None,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["room"]["joined"], true);
+        assert_eq!(body["room"]["member_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn join_unknown_room_is_404() {
+        let router = test_app(test_db());
+        let cookie = logged_in(&router, "alice").await;
+        let (status, body, _) = req(&router, "POST", "/api/v1/rooms/999/join", None, Some(&cookie))
+            .await;
+        assert_eq!(status, 404);
+        assert!(body["error"].as_str().unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn join_without_a_session_is_401() {
+        let db = test_db();
+        let room_id = db.create_room(RoomKind::General, "Общий").expect("create room");
+        let router = test_app(db);
+        let (status, body, _) = req(&router, "POST", &format!("/api/v1/rooms/{room_id}/join"), None, None).await;
+        assert_eq!(status, 401);
+        assert_eq!(body["error"], "not logged in");
+    }
+
+    #[tokio::test]
+    async fn leave_removes_the_membership() {
+        let db = test_db();
+        let room_id = db.create_room(RoomKind::General, "Общий").expect("create room");
+        let router = test_app(db);
+        let cookie = logged_in(&router, "alice").await;
+
+        req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/join"),
+            None,
+            Some(&cookie),
+        )
+        .await;
+
+        // Leave → 200, membership gone.
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/leave"),
+            None,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["room"]["joined"], false);
+        assert_eq!(body["room"]["member_count"], 0);
+
+        // The list agrees.
+        let (status, body, _) = req(&router, "GET", "/api/v1/rooms", None, Some(&cookie)).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["rooms"][0]["joined"], false);
+    }
+
+    #[tokio::test]
+    async fn leave_without_joining_is_404() {
+        let db = test_db();
+        let room_id = db.create_room(RoomKind::General, "Общий").expect("create room");
+        let router = test_app(db);
+        let cookie = logged_in(&router, "alice").await;
+        let (status, _, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/leave"),
+            None,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 404, "never joined → no membership to remove");
+    }
+
+    #[tokio::test]
+    async fn leave_unknown_room_is_404() {
+        let router = test_app(test_db());
+        let cookie = logged_in(&router, "alice").await;
+        let (status, _, _) = req(&router, "POST", "/api/v1/rooms/999/leave", None, Some(&cookie))
+            .await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn member_count_counts_distinct_users() {
+        let db = test_db();
+        let room_id = db.create_room(RoomKind::General, "Общий").expect("create room");
+        let router = test_app(db);
+
+        let alice = logged_in(&router, "alice").await;
+        let bob = logged_in(&router, "bob").await;
+
+        req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/join"),
+            None,
+            Some(&alice),
+        )
+        .await;
+        req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/join"),
+            None,
+            Some(&bob),
+        )
+        .await;
+
+        // Both see the same count; their own `joined` flag is independent.
+        for cookie in [&alice, &bob] {
+            let (status, body, _) = req(&router, "GET", "/api/v1/rooms", None, Some(cookie)).await;
+            assert_eq!(status, 200);
+            assert_eq!(body["rooms"][0]["member_count"], 2);
+            assert_eq!(body["rooms"][0]["joined"], true);
+        }
     }
 }

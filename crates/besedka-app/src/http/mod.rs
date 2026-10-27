@@ -8,16 +8,17 @@
 pub mod extract;
 pub mod sso;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use besedka_core::User;
-use besedka_infra::DbError;
+use besedka_infra::{DbError, RoomView};
 use serde::Serialize;
 use thiserror::Error;
 use tower_sessions::Session;
 
+use crate::http::extract::AuthedUser;
 use crate::AppState;
 
 /// Key under which the authenticated user's id is stored in the session.
@@ -71,7 +72,13 @@ impl IntoResponse for HttpError {
 
 impl From<DbError> for HttpError {
     fn from(e: DbError) -> Self {
-        Self::internal(e.to_string())
+        match e {
+            DbError::NotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "room not found",
+            ),
+            other => Self::internal(other.to_string()),
+        }
     }
 }
 
@@ -86,7 +93,12 @@ pub struct PingResponse {
 
 #[derive(Debug, Serialize)]
 pub struct RoomsResponse {
-    rooms: Vec<besedka_core::Room>,
+    rooms: Vec<RoomView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RoomViewResponse {
+    room: RoomView,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,14 +161,71 @@ pub async fn ping() -> Json<PingResponse> {
     })
 }
 
-/// `GET /api/v1/rooms` — the room list (Wave 0: whatever is in the DB).
-pub async fn rooms(State(state): State<AppState>) -> Result<Json<RoomsResponse>, HttpError> {
-    let db = state.db.clone();
-    let rooms = tokio::task::spawn_blocking(move || db.list_rooms())
+/// `GET /api/v1/rooms` — the room list, each with the viewer's membership
+/// state: `joined` (is the current user a member?) and `member_count`.
+/// Anonymous viewers get `joined: false` everywhere.
+pub async fn rooms(
+    State(state): State<AppState>,
+    session: Session,
+) -> Result<Json<RoomsResponse>, HttpError> {
+    let user_id: Option<i64> = session
+        .get(SESSION_USER_ID)
         .await
-        .map_err(|e| HttpError::internal(format!("background task failed: {e}")))?
-        .map_err(HttpError::from)?;
+        .map_err(|e| HttpError::internal(format!("failed to read session: {e}")))
+        .ok()
+        .flatten();
+    let db = state.db.clone();
+    let rooms = tokio::task::spawn_blocking(move || db.list_rooms_for_user(user_id))
+        .await
+        .map_err(|e| HttpError::internal(format!("background task failed: {e}")))??;
     Ok(Json(RoomsResponse { rooms }))
+}
+
+/// `POST /api/v1/rooms/{id}/join` — join the room (idempotent; 404 if the
+/// room does not exist). Any authenticated user.
+pub async fn join_room(
+    State(state): State<AppState>,
+    AuthedUser(user): AuthedUser,
+    Path(room_id): Path<i64>,
+) -> Result<Json<RoomViewResponse>, HttpError> {
+    let db = state.db.clone();
+    let user_id = user.id;
+    let room = tokio::task::spawn_blocking(move || -> Result<RoomView, DbError> {
+        // Unknown room -> 404 via DbError::NotFound.
+        db.room_view(room_id, user_id)?
+            .ok_or(DbError::NotFound)?;
+        // Idempotent: re-joining is a no-op.
+        db.join_room(room_id, user_id)?;
+        // Re-read AFTER the join so `joined`/`member_count` are current.
+        db.room_view(room_id, user_id)?.ok_or(DbError::NotFound)
+    })
+    .await
+    .map_err(|e| HttpError::internal(format!("background task failed: {e}")))??;
+    Ok(Json(RoomViewResponse { room }))
+}
+
+/// `POST /api/v1/rooms/{id}/leave` — leave the room; 404 if the room does
+/// not exist or the user was never a member.
+pub async fn leave_room(
+    State(state): State<AppState>,
+    AuthedUser(user): AuthedUser,
+    Path(room_id): Path<i64>,
+) -> Result<Json<RoomViewResponse>, HttpError> {
+    let db = state.db.clone();
+    let user_id = user.id;
+    let room = tokio::task::spawn_blocking(move || -> Result<RoomView, DbError> {
+        // Unknown room -> 404 via DbError::NotFound.
+        db.room_view(room_id, user_id)?
+            .ok_or(DbError::NotFound)?;
+        if !db.leave_room(room_id, user_id)? {
+            return Err(DbError::NotFound); // was not a member
+        }
+        // Re-read AFTER the leave so `joined`/`member_count` are current.
+        db.room_view(room_id, user_id)?.ok_or(DbError::NotFound)
+    })
+    .await
+    .map_err(|e| HttpError::internal(format!("background task failed: {e}")))??;
+    Ok(Json(RoomViewResponse { room }))
 }
 
 /// `POST /api/v1/register` — create a local account (role = user).

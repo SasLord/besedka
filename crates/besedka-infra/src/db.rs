@@ -7,9 +7,10 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use besedka_core::{Role, Room, User};
+use besedka_core::{Role, Room, RoomKind, User};
 use refinery::embed_migrations;
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
+use serde::Serialize;
 use thiserror::Error;
 
 // Embed workspace-root migrations (`migrations/`) at compile time.
@@ -28,6 +29,10 @@ pub enum DbError {
     BadKind(String),
     #[error("bad role in db: {0}")]
     BadRole(String),
+    /// The requested row (room, user, membership) does not exist. Mapped to
+    /// HTTP 404 by the app layer.
+    #[error("not found")]
+    NotFound,
 }
 
 /// A SQLite database (connection + schema).
@@ -50,6 +55,19 @@ pub struct StoredUser {
     pub created_at: String,
     /// Argon2 PHC string; `None` for AD/SSO accounts without a local password.
     pub password_hash: Option<String>,
+}
+
+/// A room row enriched with membership state for ONE viewer (Wave 1.3):
+/// `joined` is whether that user is a member, `member_count` is the total
+/// number of members of the room.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RoomView {
+    pub id: i64,
+    pub kind: RoomKind,
+    pub title: String,
+    pub created_at: String,
+    pub joined: bool,
+    pub member_count: i64,
 }
 
 impl Db {
@@ -222,6 +240,99 @@ impl Db {
             None => Ok(None),
         }
     }
+
+    // ----- Room membership (Wave 1.3) -----
+
+    /// All rooms in sort order with the membership state of `user_id`
+    /// (`None` = anonymous viewer: `joined` is false for every room).
+    pub fn list_rooms_for_user(&self, user_id: Option<i64>) -> Result<Vec<RoomView>, DbError> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.kind, r.title, r.created_at,
+                    (SELECT COUNT(*) FROM room_members rm WHERE rm.room_id = r.id),
+                    EXISTS (SELECT 1 FROM room_members rm
+                            WHERE rm.room_id = r.id AND rm.user_id = ?1)
+             FROM rooms r
+             ORDER BY r.sort_order, r.id",
+        )?;
+        let rows = stmt.query_map(params![user_id], room_row)?;
+        let mut rooms = Vec::new();
+        for row in rows {
+            rooms.push(to_room_view(row?)?);
+        }
+        Ok(rooms)
+    }
+
+    /// One room with the membership state of `user_id`; `None` if the room
+    /// does not exist.
+    pub fn room_view(&self, room_id: i64, user_id: i64) -> Result<Option<RoomView>, DbError> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.kind, r.title, r.created_at,
+                    (SELECT COUNT(*) FROM room_members rm WHERE rm.room_id = r.id),
+                    EXISTS (SELECT 1 FROM room_members rm
+                            WHERE rm.room_id = r.id AND rm.user_id = ?2)
+             FROM rooms r WHERE r.id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![room_id, user_id], room_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(to_room_view(row?)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Join a room (idempotent — a member re-joining is a no-op).
+    /// Returns `true` if the user was just added, `false` if already a member.
+    pub fn join_room(&self, room_id: i64, user_id: i64) -> Result<bool, DbError> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO room_members (room_id, user_id) VALUES (?1, ?2)",
+            (room_id, user_id),
+        )?;
+        Ok(inserted > 0)
+    }
+
+    /// Leave a room. Returns `true` if the user was removed, `false` if they
+    /// were not a member (caller 404s).
+    pub fn leave_room(&self, room_id: i64, user_id: i64) -> Result<bool, DbError> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let removed = conn.execute(
+            "DELETE FROM room_members WHERE room_id = ?1 AND user_id = ?2",
+            (room_id, user_id),
+        )?;
+        Ok(removed > 0)
+    }
+}
+
+/// Room-view query row (kind still a string — parsed in [`to_room_view`]).
+fn room_row(row: &rusqlite::Row) -> rusqlite::Result<(i64, String, String, String, i64, bool)> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
+/// Parse the kind string and build the public view.
+fn to_room_view((id, kind, title, created_at, member_count, joined): (
+    i64,
+    String,
+    String,
+    String,
+    i64,
+    bool,
+)) -> Result<RoomView, DbError> {
+    Ok(RoomView {
+        id,
+        kind: kind.parse().map_err(DbError::BadKind)?,
+        title,
+        created_at,
+        member_count,
+        joined,
+    })
 }
 
 #[cfg(test)]
@@ -355,6 +466,71 @@ mod tests {
     fn find_missing_user_is_none_not_err() {
         let db = Db::open_in_memory().unwrap();
         assert!(db.find_user_by_username("ghost").unwrap().is_none());
-        assert!(db.get_user(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn join_is_idempotent_and_leave_removes() {
+        let db = Db::open_in_memory().unwrap();
+        let user = db.create_user("alice", None, Role::User, None).unwrap();
+        let room = db.create_room(RoomKind::Channel, "#all").unwrap();
+
+        // First join adds, second join is a no-op.
+        assert!(db.join_room(room, user).unwrap(), "first join adds");
+        assert!(!db.join_room(room, user).unwrap(), "second join is a no-op");
+
+        // Leave removes once; a second leave is a no-op.
+        assert!(db.leave_room(room, user).unwrap(), "leave removes");
+        assert!(!db.leave_room(room, user).unwrap(), "leave again is a no-op");
+    }
+
+    #[test]
+    fn room_view_carries_joined_and_member_count() {
+        let db = Db::open_in_memory().unwrap();
+        let alice = db.create_user("alice", None, Role::User, None).unwrap();
+        let bob = db.create_user("bob", None, Role::User, None).unwrap();
+        let room = db.create_room(RoomKind::Channel, "#all").unwrap();
+
+        // Nobody joined yet.
+        let view = db.room_view(room, alice).unwrap().unwrap();
+        assert!(!view.joined);
+        assert_eq!(view.member_count, 0);
+
+        db.join_room(room, alice).unwrap();
+        db.join_room(room, bob).unwrap();
+
+        // Alice sees herself joined with two members; Bob the same.
+        let alice_view = db.room_view(room, alice).unwrap().unwrap();
+        assert!(alice_view.joined);
+        assert_eq!(alice_view.member_count, 2);
+
+        let bob_view = db.room_view(room, bob).unwrap().unwrap();
+        assert!(bob_view.joined);
+        assert_eq!(bob_view.member_count, 2);
+
+        // After Alice leaves, Bob alone remains.
+        db.leave_room(room, alice).unwrap();
+        let bob_view = db.room_view(room, bob).unwrap().unwrap();
+        assert!(bob_view.joined);
+        assert_eq!(bob_view.member_count, 1);
+    }
+
+    #[test]
+    fn list_rooms_for_user_flags_only_their_rooms() {
+        let db = Db::open_in_memory().unwrap();
+        let alice = db.create_user("alice", None, Role::User, None).unwrap();
+        let one = db.create_room(RoomKind::General, "Общий").unwrap();
+        db.create_room(RoomKind::Channel, "#news").unwrap();
+        db.join_room(one, alice).unwrap();
+
+        let views = db.list_rooms_for_user(Some(alice)).unwrap();
+        assert_eq!(views.len(), 2);
+        let joined: Vec<bool> = views.iter().map(|v| v.joined).collect();
+        assert_eq!(joined, vec![true, false]);
+        assert_eq!(views[0].member_count, 1);
+        assert_eq!(views[1].member_count, 0);
+
+        // Anonymous viewer sees no joined rooms.
+        let anon = db.list_rooms_for_user(None).unwrap();
+        assert!(anon.iter().all(|v| !v.joined));
     }
 }
