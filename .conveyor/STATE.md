@@ -22,6 +22,7 @@ _Обновлено: 2026-10-27 · Source of truth «где мы»._
 | **Wave 1.2 (AD/Kerberos SSO + mock)** | ✅ **DONE** (2026-10-27, 137 tests зелёные, clippy 0 deny) |
 | **Wave 1.3 (список комнат + join/leave + роли)** | ✅ **DONE** (2026-10-27, 148 tests, clippy 0, svelte-check 0, UI в браузере) |
 | **Wave 1 (аутентификация + комнаты)** | ✅ **ПОЛНОСТЬЮ ЗАВЕРШЕНА** (2026-10-27, коммит `e5340ce`, pushed) |
+| **Wave 2.1 (каналы + сообщения append в БД + API)** | ✅ **DONE** (2026-10-27, 166 tests, clippy 0, коммит `89b7b39`, pushed) |
 
 ## Wave 0 — что сделано (принято)
 - Cargo-воркспейс: `besedka-core` (типы users/roles/rooms) · `besedka-infra` (rusqlite bundled + refinery) · `besedka-app` (axum + бинарник).
@@ -61,13 +62,24 @@ _Обновлено: 2026-10-27 · Source of truth «где мы»._
 - **Демо-данные:** dev-БД `data/besedka.db` — 3 комнаты (Общий/Работа/Новости) вставлены вручную (V1 без сида).
 - **Commit:** `e5340ce` — `feat(rooms): Wave 1.3 — room list + join/leave + role gates (app+ui)`, pushed в origin/main.
 
+## Wave 2.1 — что сделано (принято)
+- **CORE (besedka-core):** `message.rs` — `Message { id, room_id, sender_id, text, created_at }`. **Формат времени (единый для проекта):** RFC 3339 UTC с миллисекундной точностью (`%Y-%m-%dT%H:%M:%fZ`), строка в БД — дефолт SQLite. «Канал» = комната вида `RoomKind::Channel` (таблицы каналов нет). Поля `edited_at`/`deleted_by` появятся в 2.3 — в 2.1 намеренно их НЕТ.
+- **INFRA (besedka-infra):** миграция `migrations/V4__messages.sql` — `messages(id INTEGER PK AUTOINCREMENT, room_id FK→rooms ON DELETE CASCADE, sender_id FK→users ON DELETE CASCADE, text TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT …)` + индексы `(room_id, id)` (пагинация) и `sender_id` (аудит/поиск). Методы: `Db::create_message` · `Db::list_messages(room_id, limit, before_id)` — курсорная пагинация: свежие N, страница «до `before_id`», лимит по умолчанию 50 / максимум 200 (больше — 200, меньше 1 — ошибка) · `Db::get_message`.
+- **APP (besedka-app) — только API (UI-чат = 2.2):** `POST /api/v1/rooms` (AdminUser; `{kind: room|channel, title}`; title 1–128; создатель становится участником; не-админ → 403; плохой kind/title → 400) → 201 + комната · `POST /api/v1/rooms/{id}/messages` (AuthedUser + участник; текст 1–4096, trim; не-участник → 403; комнаты нет → 404; пустой/длинный → 400) → 201 + сообщение · `GET /api/v1/rooms/{id}/messages?limit=&before_id=` (AuthedUser + участник) → `{"messages": [...]}`; пустая комната → `{"messages": []}`.
+- **Тесты:** infra **87 passed** (новые: create→read, пагинация/границы лимитов/курсор, FK-каскады комната→сообщения и пользователь→сообщения, пустая комната → []) · app **67 passed** (новые: принять-поток «admin создаёт канал → пост → чтение», пост не-участника → 403, создание комнаты не-админом → 403, пустой/длинный текст → 400, пустая комната → `[]`, пагинация на 2 страницы) · core 12 passed.
+- **Гейты:** `cargo build` OK · `cargo test --workspace` — **166 passed / 0 failed** · `cargo clippy --all-targets -- -D warnings` — **0** · UI в срезе не менялся → npm-гейты не требовались.
+- **Commit:** `89b7b39` — `feat(messages): Wave 2.1 — channels + messages append (core+infra+api)`, pushed в origin/main.
+
 ## Дальше
 **WAVE 1 (аутентификация + комнаты) — ✅ ПОЛНОСТЬЮ ЗАВЕРШЕНА** (2026-10-27):
 1. **1.1 ✅** register/login/logout/me (argon2) + сессии + `users`/`roles` в core.
 2. **1.2 ✅** AD/Kerberos SSO (`GET /auth_ad_sso`, `POST /auth_ad_login`, status, admin-диагностика) + mock-режим + ролевые гейты.
 3. **1.3 ✅** список комнат + join/leave + ролевые гейты (app + ui).
 
-**Дальше — Wave 2 (сообщения):** см. `PLAN.md` — история сообщений в комнате, отправка/получение, базовые события.
+**WAVE 2 (сообщения) — начата:**
+1. **2.1 ✅** Каналы + сообщения (append) в БД (core + infra + API) — см. секцию выше (коммит `89b7b39`).
+2. **2.2 →** [app+ui] Пост/список сообщений (WS или поллинг) + пагинация. **Accept:** обмен в UI.
+3. **2.3 →** [app+ui] Edit/delete своего сообщения + read receipts. (поэтому в 2.1 полей `edited_at`/`deleted_by` нет).
 
 ## Указатели контекста
 - Конвенции/стек/роли: `CONVENTIONS.md`
