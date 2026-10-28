@@ -4,21 +4,23 @@
 //! local password auth over `tower_sessions` (in-memory store, cookie session;
 //! see lib.rs for the wiring). Wave 1.2: AD/Kerberos SSO ([`sso`]) and the
 //! session-backed role gates ([`extract`]).
+//! Wave 2.1: room creation (`POST /rooms`, admin) + message posting/reading
+//! (`POST|GET /rooms/{id}/messages`, members only) — append-only messages.
 
 pub mod extract;
 pub mod sso;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use besedka_core::User;
+use besedka_core::{Message, Room, RoomKind, User};
 use besedka_infra::{DbError, RoomView};
 use serde::Serialize;
 use thiserror::Error;
 use tower_sessions::Session;
 
-use crate::http::extract::AuthedUser;
+use crate::http::extract::{AdminUser, AuthedUser};
 use crate::AppState;
 
 /// Key under which the authenticated user's id is stored in the session.
@@ -47,6 +49,9 @@ impl HttpError {
     }
     pub(crate) fn unauthorized(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNAUTHORIZED, message)
+    }
+    pub(crate) fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, message)
     }
     pub(crate) fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, message)
@@ -77,6 +82,7 @@ impl From<DbError> for HttpError {
                 StatusCode::NOT_FOUND,
                 "room not found",
             ),
+            DbError::Forbidden => Self::forbidden("you are not a member of this room"),
             other => Self::internal(other.to_string()),
         }
     }
@@ -104,6 +110,49 @@ pub struct RoomViewResponse {
 #[derive(Debug, Serialize)]
 pub struct UserResponse {
     user: User,
+}
+
+// ----- Wave 2.1: rooms (creation) + messages (append-only) -----
+
+/// `kind` is `"room"` or `"channel"` (see `RoomKind`); `title` is 1–128
+/// characters after trimming.
+#[derive(Debug, serde::Deserialize)]
+pub struct CreateRoomRequest {
+    kind: String,
+    title: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RoomResponse {
+    room: Room,
+}
+
+/// `text` is 1–4096 characters after trimming.
+#[derive(Debug, serde::Deserialize)]
+pub struct PostMessageRequest {
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MessageResponse {
+    message: Message,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MessagesResponse {
+    messages: Vec<Message>,
+}
+
+/// `GET /rooms/{id}/messages` query params:
+/// - `limit` — page size, 1..=200 (default 50);
+/// - `before_id` — cursor: return the page immediately before this message id
+///   (oldest page of all when absent).
+#[derive(Debug, serde::Deserialize)]
+pub struct ListMessagesQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    before_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -322,4 +371,117 @@ pub async fn me(
         .get_user(user_id)?
         .ok_or_else(|| HttpError::unauthorized("account no longer exists"))?;
     Ok(Json(UserResponse { user }))
+}
+
+/// `POST /api/v1/rooms` — create a room (admin only; non-admins get 403).
+///
+/// `kind` must be `room` or `channel` (400 otherwise), `title` must be 1–128
+/// characters after trimming (400 otherwise). The creator is auto-joined:
+/// membership is the gate for posting/reading, and the acceptance flow
+/// «create channel → post → read» runs as a single user.
+pub async fn create_room(
+    State(state): State<AppState>,
+    AdminUser(user): AdminUser,
+    Json(payload): Json<CreateRoomRequest>,
+) -> Result<(StatusCode, Json<RoomResponse>), HttpError> {
+    let kind = match payload.kind.trim().to_lowercase().as_str() {
+        "room" => RoomKind::Room,
+        "channel" => RoomKind::Channel,
+        other => {
+            return Err(HttpError::bad_request(format!(
+                "kind must be 'room' or 'channel' (got '{other}')"
+            )))
+        }
+    };
+    let title = payload.title.trim().to_string();
+    if title.is_empty() || title.chars().count() > 128 {
+        return Err(HttpError::bad_request("title must be 1–128 characters"));
+    }
+
+    let db = state.db.clone();
+    let user_id = user.id;
+    let room = tokio::task::spawn_blocking(move || {
+        let id = db.create_room(kind, &title)?;
+        // Creator becomes a member (idempotent join).
+        db.join_room(id, user_id)?;
+        db.get_room(id)?.ok_or(DbError::NotFound)
+    })
+    .await
+    .map_err(|e| HttpError::internal(format!("background task failed: {e}")))??;
+    Ok((StatusCode::CREATED, Json(RoomResponse { room })))
+}
+
+/// `POST /api/v1/rooms/{id}/messages` — append a message (members only).
+///
+/// 404 if the room does not exist, 403 if the user is not a member, 400 if
+/// `text` is empty or longer than 4096 characters after trimming.
+pub async fn post_message(
+    State(state): State<AppState>,
+    AuthedUser(user): AuthedUser,
+    Path(room_id): Path<i64>,
+    Json(payload): Json<PostMessageRequest>,
+) -> Result<(StatusCode, Json<MessageResponse>), HttpError> {
+    let text = payload.text.trim().to_string();
+    if text.is_empty() {
+        return Err(HttpError::bad_request("text must not be empty"));
+    }
+    if text.chars().count() > 4096 {
+        return Err(HttpError::bad_request("text must be at most 4096 characters"));
+    }
+
+    let db = state.db.clone();
+    let user_id = user.id;
+    let message = tokio::task::spawn_blocking(move || {
+        // Unknown room -> 404; non-member -> 403 (DbError::Forbidden).
+        if db.get_room(room_id)?.is_none() {
+            return Err(DbError::NotFound);
+        }
+        if !db.is_room_member(room_id, user_id)? {
+            return Err(DbError::Forbidden);
+        }
+        let id = db.create_message(room_id, user_id, &text)?;
+        db.get_message(id)?.ok_or(DbError::NotFound)
+    })
+    .await
+    .map_err(|e| HttpError::internal(format!("background task failed: {e}")))??;
+    Ok((StatusCode::CREATED, Json(MessageResponse { message })))
+}
+
+/// `GET /api/v1/rooms/{id}/messages` — the latest page of a room's messages
+/// (members only).
+///
+/// Query: `limit` (1..=200, default 50; 400 otherwise) and `before_id`
+/// (cursor — the page immediately before this message id; absent = the
+/// newest `limit`). The page comes back in ASCENDING order (oldest →
+/// newest), ready to render top-to-bottom.
+pub async fn list_messages(
+    State(state): State<AppState>,
+    AuthedUser(user): AuthedUser,
+    Path(room_id): Path<i64>,
+    Query(query): Query<ListMessagesQuery>,
+) -> Result<Json<MessagesResponse>, HttpError> {
+    let limit = query.limit.unwrap_or(50);
+    if limit == 0 || limit > 200 {
+        return Err(HttpError::bad_request("limit must be between 1 and 200"));
+    }
+    if matches!(query.before_id, Some(id) if id <= 0) {
+        return Err(HttpError::bad_request("before_id must be a positive message id"));
+    }
+
+    let db = state.db.clone();
+    let user_id = user.id;
+    let before_id = query.before_id;
+    let messages = tokio::task::spawn_blocking(move || {
+        // Unknown room -> 404; non-member -> 403 (DbError::Forbidden).
+        if db.get_room(room_id)?.is_none() {
+            return Err(DbError::NotFound);
+        }
+        if !db.is_room_member(room_id, user_id)? {
+            return Err(DbError::Forbidden);
+        }
+        db.list_messages(room_id, limit, before_id)
+    })
+    .await
+    .map_err(|e| HttpError::internal(format!("background task failed: {e}")))??;
+    Ok(Json(MessagesResponse { messages }))
 }

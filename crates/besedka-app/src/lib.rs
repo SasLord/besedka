@@ -57,6 +57,12 @@ pub fn app(db: Arc<Db>, sessions: SessionsConfig, ad: AdRuntime) -> Router {
         .route("/api/v1/rooms", get(http::rooms))
         .route("/api/v1/rooms/{id}/join", post(http::join_room))
         .route("/api/v1/rooms/{id}/leave", post(http::leave_room))
+        // Wave 2.1 — room creation (admin) + append-only messages (members).
+        .route("/api/v1/rooms", post(http::create_room))
+        .route(
+            "/api/v1/rooms/{id}/messages",
+            post(http::post_message).get(http::list_messages),
+        )
         .route("/api/v1/register", post(http::register))
         .route("/api/v1/login", post(http::login))
         .route("/api/v1/logout", post(http::logout))
@@ -78,7 +84,7 @@ pub fn app(db: Arc<Db>, sessions: SessionsConfig, ad: AdRuntime) -> Router {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
-    use besedka_core::RoomKind;
+    use besedka_core::{Role, RoomKind};
     use besedka_infra::ad::AdConfig;
     use tower::ServiceExt;
 
@@ -949,6 +955,327 @@ mod tests {
             assert_eq!(status, 200);
             assert_eq!(body["rooms"][0]["member_count"], 2);
             assert_eq!(body["rooms"][0]["joined"], true);
+        }
+    }
+
+    // ----- Wave 2.1: room creation + append-only messages -----
+
+    /// Admin account (created directly in the DB before `test_app`) logged in
+    /// via the API; hands back the session cookie.
+    fn test_app_with_admin(db: Arc<Db>) -> Router {
+        let pw_hash = besedka_core::hash("boss-pass").expect("argon2 available");
+        db.create_user("boss", None, Role::Admin, Some(&pw_hash))
+            .expect("admin user created");
+        test_app(db)
+    }
+
+    async fn admin_cookie(router: &Router) -> String {
+        let (_, _, headers) = req(
+            router,
+            "POST",
+            "/api/v1/login",
+            Some(serde_json::json!({ "username": "boss", "password": "boss-pass" })),
+            None,
+        )
+        .await;
+        session_cookie(&headers)
+    }
+
+    /// Acceptance flow: create channel (admin) → post → read back.
+    #[tokio::test]
+    async fn admin_creates_channel_posts_and_reads() {
+        let router = test_app_with_admin(test_db());
+        let cookie = admin_cookie(&router).await;
+
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            "/api/v1/rooms",
+            Some(serde_json::json!({ "kind": "channel", "title": "obshchii" })),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 201);
+        assert_eq!(body["room"]["kind"], "channel");
+        assert_eq!(body["room"]["title"], "obshchii");
+        let room_id = body["room"]["id"].as_i64().unwrap();
+
+        // Creator is auto-joined, so posting works immediately (201).
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/messages"),
+            Some(serde_json::json!({ "text": "privet, kanal!" })),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 201);
+        assert_eq!(body["message"]["text"], "privet, kanal!");
+
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages"),
+            None,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["text"], "privet, kanal!");
+    }
+
+    #[tokio::test]
+    async fn create_room_requires_admin() {
+        let router = test_app_with_admin(test_db());
+        let cookie = logged_in(&router, "alice").await;
+
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            "/api/v1/rooms",
+            Some(serde_json::json!({ "kind": "room", "title": "ne-moya" })),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert_eq!(body["error"], "admin role required");
+    }
+
+    #[tokio::test]
+    async fn create_room_rejects_bad_kind_and_title() {
+        let router = test_app_with_admin(test_db());
+        let cookie = admin_cookie(&router).await;
+
+        let cases = [
+            serde_json::json!({ "kind": "direct", "title": "ok" }),
+            serde_json::json!({ "kind": "room", "title": "   " }),
+            serde_json::json!({ "kind": "room", "title": "a".repeat(129) }),
+        ];
+        for body in cases {
+            let (status, _, _) = req(&router, "POST", "/api/v1/rooms", Some(body), Some(&cookie))
+                .await;
+            assert_eq!(status, 400);
+        }
+        // 128-char title is right at the limit -> accepted.
+        let (status, _, _) = req(
+            &router,
+            "POST",
+            "/api/v1/rooms",
+            Some(serde_json::json!({ "kind": "room", "title": "b".repeat(128) })),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 201);
+    }
+
+    #[tokio::test]
+    async fn post_message_requires_membership() {
+        let db = test_db();
+        let room_id = db.create_room(RoomKind::Channel, "obshchii").expect("room");
+        let router = test_app(db);
+
+        let host = logged_in(&router, "host").await;
+        req(&router, "POST", &format!("/api/v1/rooms/{room_id}/join"), None, Some(&host)).await;
+
+        // Non-member cannot post (403) nor read (403).
+        let guest = logged_in(&router, "guest").await;
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/messages"),
+            Some(serde_json::json!({ "text": "vtraval?" })),
+            Some(&guest),
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert!(body["error"].as_str().unwrap().contains("member"));
+        let (status, _, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages"),
+            None,
+            Some(&guest),
+        )
+        .await;
+        assert_eq!(status, 403);
+
+        // The host, who IS a member, can still post (201).
+        let (status, _, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/messages"),
+            Some(serde_json::json!({ "text": "ok" })),
+            Some(&host),
+        )
+        .await;
+        assert_eq!(status, 201);
+    }
+
+    #[tokio::test]
+    async fn messages_unknown_room_is_404() {
+        let router = test_app(test_db());
+        let cookie = logged_in(&router, "alice").await;
+
+        let (status, _, _) = req(
+            &router,
+            "POST",
+            "/api/v1/rooms/999/messages",
+            Some(serde_json::json!({ "text": "komu?" })),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 404);
+        let (status, _, _) = req(
+            &router,
+            "GET",
+            "/api/v1/rooms/999/messages",
+            None,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn post_message_rejects_empty_and_long_text() {
+        let db = test_db();
+        let room_id = db.create_room(RoomKind::Channel, "obshchii").expect("room");
+        let router = test_app(db);
+        let cookie = logged_in(&router, "alice").await;
+        req(&router, "POST", &format!("/api/v1/rooms/{room_id}/join"), None, Some(&cookie)).await;
+
+        // Empty / whitespace-only -> 400.
+        for text in ["", "   "] {
+            let (status, _, _) = req(
+                &router,
+                "POST",
+                &format!("/api/v1/rooms/{room_id}/messages"),
+                Some(serde_json::json!({ "text": text })),
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, 400);
+        }
+        // 4096 chars is right at the limit -> accepted; 4097 -> 400.
+        let (status, _, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/messages"),
+            Some(serde_json::json!({ "text": "a".repeat(4096) })),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 201);
+        let (status, _, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/messages"),
+            Some(serde_json::json!({ "text": "a".repeat(4097) })),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 400);
+    }
+
+    #[tokio::test]
+    async fn empty_room_lists_no_messages() {
+        let db = test_db();
+        let room_id = db.create_room(RoomKind::Channel, "tihiy").expect("room");
+        let router = test_app(db);
+        let cookie = logged_in(&router, "alice").await;
+        req(&router, "POST", &format!("/api/v1/rooms/{room_id}/join"), None, Some(&cookie)).await;
+
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages"),
+            None,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["messages"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn messages_pagination_two_pages() {
+        let db = test_db();
+        let room_id = db.create_room(RoomKind::Channel, "lenta").expect("room");
+        let router = test_app(db);
+        let cookie = logged_in(&router, "alice").await;
+        req(&router, "POST", &format!("/api/v1/rooms/{room_id}/join"), None, Some(&cookie)).await;
+
+        let mut ids = Vec::new();
+        for text in ["pervyi", "vtoroi", "tretii"] {
+            let (status, body, _) = req(
+                &router,
+                "POST",
+                &format!("/api/v1/rooms/{room_id}/messages"),
+                Some(serde_json::json!({ "text": text })),
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, 201);
+            ids.push(body["message"]["id"].as_i64().unwrap());
+        }
+
+        // Page 1 (limit=2): the latest 2 messages, ascending.
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages?limit=2"),
+            None,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let page1: Vec<i64> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(page1, vec![ids[1], ids[2]]);
+
+        // Page 2 (cursor before the oldest of page 1): exactly the first one.
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages?limit=2&before_id={}", ids[1]),
+            None,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let page2: Vec<i64> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(page2, vec![ids[0]]);
+    }
+
+    #[tokio::test]
+    async fn list_messages_rejects_bad_limit_and_cursor() {
+        let db = test_db();
+        let room_id = db.create_room(RoomKind::Channel, "obshchii").expect("room");
+        let router = test_app(db);
+        let cookie = logged_in(&router, "alice").await;
+        req(&router, "POST", &format!("/api/v1/rooms/{room_id}/join"), None, Some(&cookie)).await;
+
+        for qs in ["limit=0", "limit=201", "before_id=0", "before_id=-1"] {
+            let (status, _, _) = req(
+                &router,
+                "GET",
+                &format!("/api/v1/rooms/{room_id}/messages?{qs}"),
+                None,
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, 400, "query '{qs}' must be rejected");
         }
     }
 }
