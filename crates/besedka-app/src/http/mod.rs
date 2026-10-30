@@ -78,10 +78,7 @@ impl IntoResponse for HttpError {
 impl From<DbError> for HttpError {
     fn from(e: DbError) -> Self {
         match e {
-            DbError::NotFound => Self::new(
-                StatusCode::NOT_FOUND,
-                "room not found",
-            ),
+            DbError::NotFound => Self::new(StatusCode::NOT_FOUND, "room not found"),
             DbError::Forbidden => Self::forbidden("you are not a member of this room"),
             other => Self::internal(other.to_string()),
         }
@@ -110,6 +107,22 @@ pub struct RoomViewResponse {
 #[derive(Debug, Serialize)]
 pub struct UserResponse {
     user: User,
+}
+
+// ----- Wave 2.2: user catalog (sender names in the UI) -----
+
+/// One entry of the user catalog: public id + name.
+#[derive(Debug, Serialize)]
+pub struct UserDto {
+    id: i64,
+    display_name: String,
+}
+
+/// `GET /api/v1/users` response — all registered users. The UI maps
+/// id → name for sender labels (and read receipts in 2.3).
+#[derive(Debug, Serialize)]
+pub struct UsersResponse {
+    users: Vec<UserDto>,
 }
 
 // ----- Wave 2.1: rooms (creation) + messages (append-only) -----
@@ -241,8 +254,7 @@ pub async fn join_room(
     let user_id = user.id;
     let room = tokio::task::spawn_blocking(move || -> Result<RoomView, DbError> {
         // Unknown room -> 404 via DbError::NotFound.
-        db.room_view(room_id, user_id)?
-            .ok_or(DbError::NotFound)?;
+        db.room_view(room_id, user_id)?.ok_or(DbError::NotFound)?;
         // Idempotent: re-joining is a no-op.
         db.join_room(room_id, user_id)?;
         // Re-read AFTER the join so `joined`/`member_count` are current.
@@ -264,8 +276,7 @@ pub async fn leave_room(
     let user_id = user.id;
     let room = tokio::task::spawn_blocking(move || -> Result<RoomView, DbError> {
         // Unknown room -> 404 via DbError::NotFound.
-        db.room_view(room_id, user_id)?
-            .ok_or(DbError::NotFound)?;
+        db.room_view(room_id, user_id)?.ok_or(DbError::NotFound)?;
         if !db.leave_room(room_id, user_id)? {
             return Err(DbError::NotFound); // was not a member
         }
@@ -373,6 +384,27 @@ pub async fn me(
     Ok(Json(UserResponse { user }))
 }
 
+/// `GET /api/v1/users` — the catalog of all users (any logged-in user).
+///
+/// `display_name` falls back to `username` when unset (the DB layer
+/// coalesces it). The UI loads this once after login and maps
+/// id → name for sender labels (Wave 2.2; reused for read receipts in 2.3).
+pub async fn list_users(
+    State(state): State<AppState>,
+    AuthedUser(_user): AuthedUser,
+) -> Result<Json<UsersResponse>, HttpError> {
+    let db = state.db.clone();
+    let rows = tokio::task::spawn_blocking(move || db.list_users())
+        .await
+        .map_err(|e| HttpError::internal(format!("background task failed: {e}")))?
+        .map_err(HttpError::from)?;
+    let users = rows
+        .into_iter()
+        .map(|(id, display_name)| UserDto { id, display_name })
+        .collect();
+    Ok(Json(UsersResponse { users }))
+}
+
 /// `POST /api/v1/rooms` — create a room (admin only; non-admins get 403).
 ///
 /// `kind` must be `room` or `channel` (400 otherwise), `title` must be 1–128
@@ -426,7 +458,9 @@ pub async fn post_message(
         return Err(HttpError::bad_request("text must not be empty"));
     }
     if text.chars().count() > 4096 {
-        return Err(HttpError::bad_request("text must be at most 4096 characters"));
+        return Err(HttpError::bad_request(
+            "text must be at most 4096 characters",
+        ));
     }
 
     let db = state.db.clone();
@@ -465,7 +499,9 @@ pub async fn list_messages(
         return Err(HttpError::bad_request("limit must be between 1 and 200"));
     }
     if matches!(query.before_id, Some(id) if id <= 0) {
-        return Err(HttpError::bad_request("before_id must be a positive message id"));
+        return Err(HttpError::bad_request(
+            "before_id must be a positive message id",
+        ));
     }
 
     let db = state.db.clone();

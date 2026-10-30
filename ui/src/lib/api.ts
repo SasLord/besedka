@@ -29,8 +29,35 @@ export interface SsoStatus {
   password_login: boolean;
 }
 
+/** A chat message (Wave 2.1). `created_at` is RFC 3339 UTC, milliseconds. */
+export interface Message {
+  id: number;
+  room_id: number;
+  sender_id: number;
+  text: string;
+  created_at: string;
+}
+
+/** A user from the catalog endpoint (Wave 2.2) — enough to name senders. */
+export interface UserRef {
+  id: number;
+  display_name: string;
+}
+
 interface RoomsResponse {
   rooms: Room[];
+}
+
+interface MessagesResponse {
+  messages: Message[];
+}
+
+interface MessageEnvelope {
+  message: Message;
+}
+
+interface UsersResponse {
+  users: UserRef[];
 }
 
 interface RoomEnvelope {
@@ -119,6 +146,33 @@ export function joinRoom(id: number): Promise<Room> {
 /** Leave a room; 404 when the room is unknown or the user was not a member. */
 export function leaveRoom(id: number): Promise<Room> {
   return request<RoomEnvelope>(`/api/v1/rooms/${id}/leave`, jsonInit("POST")).then((r) => r.room);
+}
+
+// ----- Wave 2.2: chat + user catalog ----
+
+/**
+ * The latest `limit` messages (default 50, max 200) in ASCENDING order
+ * (oldest → newest); with `beforeId` — the page immediately before that
+ * message id (older page). Members only (403 otherwise).
+ */
+export function listMessages(roomId: number, limit?: number, beforeId?: number): Promise<Message[]> {
+  const params = new URLSearchParams();
+  if (limit !== undefined) params.set("limit", String(limit));
+  if (beforeId !== undefined) params.set("before_id", String(beforeId));
+  const suffix = params.size ? `?${params.toString()}` : "";
+  return request<MessagesResponse>(`/api/v1/rooms/${roomId}/messages${suffix}`).then((r) => r.messages);
+}
+
+/** Post a message to the room (members only). Returns the stored message. */
+export function postMessage(roomId: number, text: string): Promise<Message> {
+  return request<MessageEnvelope>(`/api/v1/rooms/${roomId}/messages`, jsonInit("POST", { text })).then(
+    (r) => r.message,
+  );
+}
+
+/** The user catalog: `{ id, display_name }` for every registered user. */
+export function fetchUsers(): Promise<UserRef[]> {
+  return request<UsersResponse>("/api/v1/users").then((r) => r.users);
 }
 
 // ----- Wave 1.2: AD/SSO ----

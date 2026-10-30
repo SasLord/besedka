@@ -67,6 +67,8 @@ pub fn app(db: Arc<Db>, sessions: SessionsConfig, ad: AdRuntime) -> Router {
         .route("/api/v1/login", post(http::login))
         .route("/api/v1/logout", post(http::logout))
         .route("/api/v1/me", get(http::me))
+        // Wave 2.2 — user catalog (sender names in the UI; reused by 2.3).
+        .route("/api/v1/users", get(http::list_users))
         // Wave 1.2 — AD/Kerberos SSO.
         .route("/api/v1/auth_ad_sso", get(http::sso::ad_sso))
         .route(
@@ -772,7 +774,9 @@ mod tests {
     #[tokio::test]
     async fn join_marks_the_room_and_the_list_reflects_it() {
         let db = test_db();
-        let room_id = db.create_room(RoomKind::General, "Новости").expect("create room");
+        let room_id = db
+            .create_room(RoomKind::General, "Новости")
+            .expect("create room");
         let router = test_app(db);
         let cookie = logged_in(&router, "alice").await;
 
@@ -813,7 +817,9 @@ mod tests {
     #[tokio::test]
     async fn double_join_is_idempotent() {
         let db = test_db();
-        let room_id = db.create_room(RoomKind::General, "Общий").expect("create room");
+        let room_id = db
+            .create_room(RoomKind::General, "Общий")
+            .expect("create room");
         let router = test_app(db);
         let cookie = logged_in(&router, "alice").await;
 
@@ -846,8 +852,14 @@ mod tests {
     async fn join_unknown_room_is_404() {
         let router = test_app(test_db());
         let cookie = logged_in(&router, "alice").await;
-        let (status, body, _) = req(&router, "POST", "/api/v1/rooms/999/join", None, Some(&cookie))
-            .await;
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            "/api/v1/rooms/999/join",
+            None,
+            Some(&cookie),
+        )
+        .await;
         assert_eq!(status, 404);
         assert!(body["error"].as_str().unwrap().contains("not found"));
     }
@@ -855,9 +867,18 @@ mod tests {
     #[tokio::test]
     async fn join_without_a_session_is_401() {
         let db = test_db();
-        let room_id = db.create_room(RoomKind::General, "Общий").expect("create room");
+        let room_id = db
+            .create_room(RoomKind::General, "Общий")
+            .expect("create room");
         let router = test_app(db);
-        let (status, body, _) = req(&router, "POST", &format!("/api/v1/rooms/{room_id}/join"), None, None).await;
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/join"),
+            None,
+            None,
+        )
+        .await;
         assert_eq!(status, 401);
         assert_eq!(body["error"], "not logged in");
     }
@@ -865,7 +886,9 @@ mod tests {
     #[tokio::test]
     async fn leave_removes_the_membership() {
         let db = test_db();
-        let room_id = db.create_room(RoomKind::General, "Общий").expect("create room");
+        let room_id = db
+            .create_room(RoomKind::General, "Общий")
+            .expect("create room");
         let router = test_app(db);
         let cookie = logged_in(&router, "alice").await;
 
@@ -900,7 +923,9 @@ mod tests {
     #[tokio::test]
     async fn leave_without_joining_is_404() {
         let db = test_db();
-        let room_id = db.create_room(RoomKind::General, "Общий").expect("create room");
+        let room_id = db
+            .create_room(RoomKind::General, "Общий")
+            .expect("create room");
         let router = test_app(db);
         let cookie = logged_in(&router, "alice").await;
         let (status, _, _) = req(
@@ -918,15 +943,23 @@ mod tests {
     async fn leave_unknown_room_is_404() {
         let router = test_app(test_db());
         let cookie = logged_in(&router, "alice").await;
-        let (status, _, _) = req(&router, "POST", "/api/v1/rooms/999/leave", None, Some(&cookie))
-            .await;
+        let (status, _, _) = req(
+            &router,
+            "POST",
+            "/api/v1/rooms/999/leave",
+            None,
+            Some(&cookie),
+        )
+        .await;
         assert_eq!(status, 404);
     }
 
     #[tokio::test]
     async fn member_count_counts_distinct_users() {
         let db = test_db();
-        let room_id = db.create_room(RoomKind::General, "Общий").expect("create room");
+        let room_id = db
+            .create_room(RoomKind::General, "Общий")
+            .expect("create room");
         let router = test_app(db);
 
         let alice = logged_in(&router, "alice").await;
@@ -1054,8 +1087,8 @@ mod tests {
             serde_json::json!({ "kind": "room", "title": "a".repeat(129) }),
         ];
         for body in cases {
-            let (status, _, _) = req(&router, "POST", "/api/v1/rooms", Some(body), Some(&cookie))
-                .await;
+            let (status, _, _) =
+                req(&router, "POST", "/api/v1/rooms", Some(body), Some(&cookie)).await;
             assert_eq!(status, 400);
         }
         // 128-char title is right at the limit -> accepted.
@@ -1077,7 +1110,14 @@ mod tests {
         let router = test_app(db);
 
         let host = logged_in(&router, "host").await;
-        req(&router, "POST", &format!("/api/v1/rooms/{room_id}/join"), None, Some(&host)).await;
+        req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/join"),
+            None,
+            Some(&host),
+        )
+        .await;
 
         // Non-member cannot post (403) nor read (403).
         let guest = logged_in(&router, "guest").await;
@@ -1144,7 +1184,14 @@ mod tests {
         let room_id = db.create_room(RoomKind::Channel, "obshchii").expect("room");
         let router = test_app(db);
         let cookie = logged_in(&router, "alice").await;
-        req(&router, "POST", &format!("/api/v1/rooms/{room_id}/join"), None, Some(&cookie)).await;
+        req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/join"),
+            None,
+            Some(&cookie),
+        )
+        .await;
 
         // Empty / whitespace-only -> 400.
         for text in ["", "   "] {
@@ -1185,7 +1232,14 @@ mod tests {
         let room_id = db.create_room(RoomKind::Channel, "tihiy").expect("room");
         let router = test_app(db);
         let cookie = logged_in(&router, "alice").await;
-        req(&router, "POST", &format!("/api/v1/rooms/{room_id}/join"), None, Some(&cookie)).await;
+        req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/join"),
+            None,
+            Some(&cookie),
+        )
+        .await;
 
         let (status, body, _) = req(
             &router,
@@ -1205,7 +1259,14 @@ mod tests {
         let room_id = db.create_room(RoomKind::Channel, "lenta").expect("room");
         let router = test_app(db);
         let cookie = logged_in(&router, "alice").await;
-        req(&router, "POST", &format!("/api/v1/rooms/{room_id}/join"), None, Some(&cookie)).await;
+        req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/join"),
+            None,
+            Some(&cookie),
+        )
+        .await;
 
         let mut ids = Vec::new();
         for text in ["pervyi", "vtoroi", "tretii"] {
@@ -1243,7 +1304,10 @@ mod tests {
         let (status, body, _) = req(
             &router,
             "GET",
-            &format!("/api/v1/rooms/{room_id}/messages?limit=2&before_id={}", ids[1]),
+            &format!(
+                "/api/v1/rooms/{room_id}/messages?limit=2&before_id={}",
+                ids[1]
+            ),
             None,
             Some(&cookie),
         )
@@ -1264,7 +1328,14 @@ mod tests {
         let room_id = db.create_room(RoomKind::Channel, "obshchii").expect("room");
         let router = test_app(db);
         let cookie = logged_in(&router, "alice").await;
-        req(&router, "POST", &format!("/api/v1/rooms/{room_id}/join"), None, Some(&cookie)).await;
+        req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/join"),
+            None,
+            Some(&cookie),
+        )
+        .await;
 
         for qs in ["limit=0", "limit=201", "before_id=0", "before_id=-1"] {
             let (status, _, _) = req(
@@ -1277,5 +1348,38 @@ mod tests {
             .await;
             assert_eq!(status, 400, "query '{qs}' must be rejected");
         }
+    }
+
+    // ----- Wave 2.2: user catalog (GET /api/v1/users) -----
+
+    #[tokio::test]
+    async fn users_catalog_lists_all_registered_users_including_self() {
+        let db = test_db();
+        let router = test_app(db);
+        let cookie = logged_in(&router, "alice").await;
+        // A second registered user must appear in alice's catalog.
+        let bob_cookie = logged_in(&router, "bob").await;
+
+        let (status, body, _) = req(&router, "GET", "/api/v1/users", None, Some(&cookie)).await;
+        assert_eq!(status, 200);
+        let users = body["users"].as_array().unwrap();
+        assert_eq!(users.len(), 2, "both registered users present: {body}");
+        // display_name falls back to username; ordered by name (alice < bob).
+        assert_eq!(users[0]["display_name"], "alice");
+        assert!(users[0]["id"].is_i64());
+        assert_eq!(users[1]["display_name"], "bob");
+
+        // And bob sees the same catalog.
+        let (status, body, _) = req(&router, "GET", "/api/v1/users", None, Some(&bob_cookie)).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["users"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn users_catalog_requires_auth() {
+        let router = test_app(test_db());
+        let (status, body, _) = req(&router, "GET", "/api/v1/users", None, None).await;
+        assert_eq!(status, 401);
+        assert_eq!(body["error"], "not logged in");
     }
 }

@@ -151,6 +151,20 @@ impl Db {
         Ok(conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get::<_, i64>(0))?)
     }
 
+    /// Catalog of all users: `(id, display_name)`; `display_name` falls
+    /// back to `username` when unset. Sorted by name — for sender names
+    /// in the UI (Wave 2.2).
+    pub fn list_users(&self) -> Result<Vec<(i64, String)>, DbError> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT id, COALESCE(display_name, username) FROM users ORDER BY display_name",
+        )?;
+        let out = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
     /// Insert a user; returns the new `id`. `password_hash` may be `None`
     /// (AD/SSO accounts). `role` defaults to `Role::User` at the DB level if
     /// you omit it, but we always pass it explicitly.
@@ -310,7 +324,8 @@ impl Db {
     /// One room by id; `None` if it does not exist (app maps to 404).
     pub fn get_room(&self, room_id: i64) -> Result<Option<Room>, DbError> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn.prepare("SELECT id, kind, title, created_at FROM rooms WHERE id = ?1")?;
+        let mut stmt =
+            conn.prepare("SELECT id, kind, title, created_at FROM rooms WHERE id = ?1")?;
         let mut rows = stmt.query_map([room_id], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -336,12 +351,13 @@ impl Db {
     /// Is `user_id` a member of `room_id`? (membership gate for posting/reading)
     pub fn is_room_member(&self, room_id: i64, user_id: i64) -> Result<bool, DbError> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        Ok(conn.query_row(
-            "SELECT 1 FROM room_members WHERE room_id = ?1 AND user_id = ?2",
-            (room_id, user_id),
-            |_| Ok(()),
-        )
-        .is_ok())
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM room_members WHERE room_id = ?1 AND user_id = ?2",
+                (room_id, user_id),
+                |_| Ok(()),
+            )
+            .is_ok())
     }
 
     // ----- Messages (Wave 2.1, append-only) -----
@@ -432,14 +448,9 @@ fn room_row(row: &rusqlite::Row) -> rusqlite::Result<(i64, String, String, Strin
 }
 
 /// Parse the kind string and build the public view.
-fn to_room_view((id, kind, title, created_at, member_count, joined): (
-    i64,
-    String,
-    String,
-    String,
-    i64,
-    bool,
-)) -> Result<RoomView, DbError> {
+fn to_room_view(
+    (id, kind, title, created_at, member_count, joined): (i64, String, String, String, i64, bool),
+) -> Result<RoomView, DbError> {
     Ok(RoomView {
         id,
         kind: kind.parse().map_err(DbError::BadKind)?,
@@ -578,6 +589,36 @@ mod tests {
     }
 
     #[test]
+    fn list_users_returns_all_with_name_fallback_sorted() {
+        let db = Db::open_in_memory().unwrap();
+        let a = db
+            .create_user("alice", Some("Alice"), Role::User, None)
+            .unwrap();
+        let b = db.create_user("bob", None, Role::User, None).unwrap(); // no display_name
+        let c = db
+            .create_user("anna", Some("Анна"), Role::Admin, None)
+            .unwrap();
+
+        let users = db.list_users().unwrap();
+        assert_eq!(users.len(), 3);
+        // Contains self + others.
+        let ids: Vec<i64> = users.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&a) && ids.contains(&b) && ids.contains(&c));
+        // Null display_name falls back to username.
+        let bob = users.iter().find(|(id, _)| *id == b).unwrap();
+        assert_eq!(bob.1, "bob");
+        // Alice keeps her display name.
+        let alice = users.iter().find(|(id, _)| *id == a).unwrap();
+        assert_eq!(alice.1, "Alice");
+    }
+
+    #[test]
+    fn list_users_empty_when_no_users() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.list_users().unwrap().is_empty());
+    }
+
+    #[test]
     fn find_missing_user_is_none_not_err() {
         let db = Db::open_in_memory().unwrap();
         assert!(db.find_user_by_username("ghost").unwrap().is_none());
@@ -595,7 +636,10 @@ mod tests {
 
         // Leave removes once; a second leave is a no-op.
         assert!(db.leave_room(room, user).unwrap(), "leave removes");
-        assert!(!db.leave_room(room, user).unwrap(), "leave again is a no-op");
+        assert!(
+            !db.leave_room(room, user).unwrap(),
+            "leave again is a no-op"
+        );
     }
 
     #[test]
@@ -662,17 +706,28 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert!(tables.contains(&"messages".to_string()), "tables: {tables:?}");
+        assert!(
+            tables.contains(&"messages".to_string()),
+            "tables: {tables:?}"
+        );
 
         let indexes: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messages'")
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messages'",
+            )
             .unwrap()
             .query_map([], |r| r.get::<_, String>(0))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert!(indexes.contains(&"idx_messages_room_id".to_string()), "indexes: {indexes:?}");
-        assert!(indexes.contains(&"idx_messages_sender".to_string()), "indexes: {indexes:?}");
+        assert!(
+            indexes.contains(&"idx_messages_room_id".to_string()),
+            "indexes: {indexes:?}"
+        );
+        assert!(
+            indexes.contains(&"idx_messages_sender".to_string()),
+            "indexes: {indexes:?}"
+        );
     }
 
     #[test]
@@ -796,9 +851,13 @@ mod tests {
         // Гвардия — в блоке: дропнута ПЕРЕД вызовом Db-методов (иначе self-deadlock).
         {
             let conn = db.conn.lock().unwrap();
-            conn.execute("DELETE FROM rooms WHERE id = ?1", [room]).unwrap();
+            conn.execute("DELETE FROM rooms WHERE id = ?1", [room])
+                .unwrap();
         }
-        assert!(db.get_message(id).unwrap().is_none(), "FK CASCADE removed it");
+        assert!(
+            db.get_message(id).unwrap().is_none(),
+            "FK CASCADE removed it"
+        );
         assert!(db.list_messages(room, 200, None).unwrap().is_empty());
     }
 
@@ -811,9 +870,13 @@ mod tests {
 
         {
             let conn = db.conn.lock().unwrap();
-            conn.execute("DELETE FROM users WHERE id = ?1", [alice]).unwrap();
+            conn.execute("DELETE FROM users WHERE id = ?1", [alice])
+                .unwrap();
         }
-        assert!(db.get_message(id).unwrap().is_none(), "FK CASCADE removed it");
+        assert!(
+            db.get_message(id).unwrap().is_none(),
+            "FK CASCADE removed it"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
     ApiError,
     fetchPing,
     fetchRooms,
+    fetchUsers,
     joinRoom,
     leaveRoom,
     logout,
@@ -14,7 +15,9 @@
     type Room,
     type SsoStatus,
     type User,
+    type UserRef,
   } from "./lib/api";
+  import RoomChat from "./lib/components/RoomChat.svelte";
 
   let user = $state<User | null>(null);
   let authChecked = $state(false);
@@ -23,6 +26,10 @@
   let error = $state<string | null>(null);
   let busyRoom = $state<number | null>(null);
   let serverOk = $state(false);
+  // Wave 2.2: user catalog (sender names) + the room whose chat is open.
+  let users = $state<UserRef[]>([]);
+  let activeRoomId = $state<number | null>(null);
+  const activeRoom = $derived(rooms.find((r) => r.id === activeRoomId) ?? null);
 
   function toMessage(e: unknown): string {
     return e instanceof ApiError
@@ -34,6 +41,57 @@
 
   async function refreshRooms() {
     rooms = await fetchRooms();
+  }
+
+  // ----- Wave 2.2: chat wiring -----
+
+  /** Sender name: catalog display name, my own name for myself, else a fallback. */
+  function userName(id: number): string {
+    const ref = users.find((u) => u.id === id);
+    if (ref) return ref.display_name;
+    if (user && user.id === id) return displayName(user);
+    return `Пользователь #${id}`;
+  }
+
+  function openRoom(room: Room) {
+    activeRoomId = room.id;
+    error = null;
+  }
+
+  /** First joined room becomes the chat on load/login (if none picked yet). */
+  function selectDefaultRoom() {
+    if (activeRoomId !== null) return;
+    const first = rooms.find((r) => r.joined);
+    if (first) activeRoomId = first.id;
+  }
+
+  /** The catalog is only for sender names — best effort, never blocks the UI. */
+  async function loadUsers() {
+    try {
+      users = await fetchUsers();
+    } catch {
+      users = [];
+    }
+  }
+
+  /** A message may arrive from an id the catalog doesn't know (a user
+   *  registered after login) — refresh the catalog once so names render. */
+  let usersRefreshing = false;
+  async function refreshUsersIfNeeded(newMsgs: { sender_id: number }[]) {
+    const me = user;
+    if (!me || !newMsgs.length) return;
+    const hasUnknown = newMsgs.some(
+      (m) => m.sender_id !== me.id && !users.some((u) => u.id === m.sender_id),
+    );
+    if (!hasUnknown || usersRefreshing) return;
+    usersRefreshing = true;
+    try {
+      users = await fetchUsers();
+    } catch {
+      // keep the old catalog; the fallback name stays
+    } finally {
+      usersRefreshing = false;
+    }
   }
 
   onMount(async () => {
@@ -58,20 +116,27 @@
       }
       user = null;
     }
+    if (user) {
+      await loadUsers();
+    }
     try {
       await refreshRooms();
     } catch (e) {
       error = toMessage(e);
-    } finally {
-      authChecked = true;
     }
+    if (user) {
+      selectDefaultRoom();
+    }
+    authChecked = true;
   });
 
   async function handleAuthed(authedUser: User) {
     user = authedUser;
     error = null;
+    await loadUsers();
     try {
       await refreshRooms();
+      selectDefaultRoom();
     } catch (e) {
       error = toMessage(e);
     }
@@ -84,6 +149,8 @@
       /* the local state resets anyway */
     }
     user = null;
+    users = [];
+    activeRoomId = null;
     try {
       await refreshRooms();
     } catch (e) {
@@ -110,7 +177,6 @@
   }
 
   const isAdmin = $derived(user?.role === "admin");
-  const firstJoined = $derived(rooms.find((r) => r.joined) ?? null);
   const displayName = (u: User) => u.display_name?.trim() || u.username;
 </script>
 
@@ -130,7 +196,21 @@
 
       <nav class="rooms" aria-label="Комнаты">
         {#each rooms as room (room.id)}
-          <div class="room" class:joined={room.joined}>
+          <div
+            class="room"
+            class:joined={room.joined}
+            class:active={room.id === activeRoomId}
+            role="button"
+            tabindex="0"
+            title={room.joined ? "Открыть чат" : "Открыть комнату"}
+            onclick={() => openRoom(room)}
+            onkeydown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                openRoom(room);
+              }
+            }}
+          >
             <div class="room__info">
               <span class="room__title">{room.title}</span>
               <span class="room__meta">
@@ -143,7 +223,10 @@
               class="room__btn"
               type="button"
               disabled={busyRoom === room.id}
-              onclick={() => toggleMembership(room)}
+              onclick={(e) => {
+                e.stopPropagation();
+                void toggleMembership(room);
+              }}
             >
               {busyRoom === room.id ? "…" : room.joined ? "Выйти" : "Войти"}
             </button>
@@ -171,39 +254,29 @@
     <main class="main">
       {#if error}
         <EmptyState icon="⚠️" title="Ошибка" text={error} />
-      {:else if firstJoined}
-        <div class="chat">
-          <header class="chat__header">
-            <span class="chat__title">{firstJoined.title}</span>
-            <span class="chat__status">
-              вы здесь · {firstJoined.member_count}
-              {firstJoined.member_count % 10 === 1 && firstJoined.member_count % 100 !== 11
-                ? "участник"
-                : [2, 3, 4].includes(firstJoined.member_count % 10) &&
-                    ![12, 13, 14].includes(firstJoined.member_count % 100)
-                  ? "участника"
-                  : "участников"}
-            </span>
-          </header>
-          <div class="chat__body">
-            <EmptyState
-              icon="💬"
-              title="Сообщения"
-              text="Переписка появится во второй волне."
-            />
-          </div>
+      {:else if activeRoom && activeRoom.joined}
+        <RoomChat room={activeRoom} meId={user.id} {userName} onNewMessages={(m) => void refreshUsersIfNeeded(m)} />
+      {:else if activeRoom}
+        <div class="joincta">
+          <span class="joincta__icon" aria-hidden="true">🔒</span>
+          <h2 class="joincta__title">Вы ещё не в «{activeRoom.title}»</h2>
+          <p class="joincta__text">
+            Присоединяйтесь к комнате, чтобы видеть историю и отправлять сообщения.
+          </p>
+          <button
+            class="room__btn joincta__btn"
+            type="button"
+            disabled={busyRoom === activeRoom.id}
+            onclick={() => void toggleMembership(activeRoom)}
+          >
+            {busyRoom === activeRoom.id ? "…" : "Войти в комнату"}
+          </button>
         </div>
-      {:else if isAdmin}
-        <EmptyState
-          icon="🛡️"
-          title="Вы не в комнатах"
-          text="Заходите в комнату кнопкой «Войти» в левой панели."
-        />
       {:else}
         <EmptyState
           icon="💬"
           title="Вы не в комнатах"
-          text="Заходите в комнату кнопкой «Войти» в левой панели."
+          text="Выберите комнату в левой панели — её чат откроется здесь."
         />
       {/if}
     </main>
@@ -283,6 +356,7 @@
     gap: var(--space-2);
     padding: var(--space-2) var(--space-3);
     border-radius: var(--radius-md);
+    cursor: pointer;
   }
 
   .room:hover {
@@ -291,6 +365,16 @@
 
   .room.joined {
     background: var(--color-accent-soft);
+  }
+
+  .room.active {
+    border-left: 3px solid var(--color-accent);
+    padding-left: calc(var(--space-3) - 3px);
+  }
+
+  .room.active .room__title {
+    color: var(--color-accent);
+    font-weight: 600;
   }
 
   .room__info {
@@ -428,36 +512,37 @@
     flex-direction: column;
   }
 
-  .chat {
+  .joincta {
     flex: 1;
     min-height: 0;
     display: flex;
     flex-direction: column;
-  }
-
-  .chat__header {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
+    align-items: center;
+    justify-content: center;
     gap: var(--space-3);
-    padding: var(--space-3) var(--space-5);
-    border-bottom: 1px solid var(--color-border);
-    background: var(--color-bg-panel);
+    padding: var(--space-5);
+    text-align: center;
   }
 
-  .chat__title {
+  .joincta__icon {
+    font-size: 40px;
+    line-height: 1;
+  }
+
+  .joincta__title {
+    margin: 0;
     font-size: var(--text-large);
     font-weight: 600;
   }
 
-  .chat__status {
+  .joincta__text {
+    margin: 0 0 var(--space-2);
+    max-width: 420px;
     color: var(--color-text-muted);
     font-size: var(--text-small);
   }
 
-  .chat__body {
-    flex: 1;
-    min-height: 0;
-    display: flex;
+  .joincta__btn {
+    padding: var(--space-2) var(--space-4);
   }
 </style>

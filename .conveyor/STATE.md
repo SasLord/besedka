@@ -1,5 +1,5 @@
 # STATE — Besedka
-_Обновлено: 2026-10-27 · Source of truth «где мы»._
+_Обновлено: 2026-10-30 · Source of truth «где мы»._
 
 ## Решения (зафиксированы)
 - **Язык:** всё на Rust (сервер + Tauri-бэкенд + биндинги). ~~Go~~ — отброшено (trackly на Rust,
@@ -23,6 +23,7 @@ _Обновлено: 2026-10-27 · Source of truth «где мы»._
 | **Wave 1.3 (список комнат + join/leave + роли)** | ✅ **DONE** (2026-10-27, 148 tests, clippy 0, svelte-check 0, UI в браузере) |
 | **Wave 1 (аутентификация + комнаты)** | ✅ **ПОЛНОСТЬЮ ЗАВЕРШЕНА** (2026-10-27, коммит `e5340ce`, pushed) |
 | **Wave 2.1 (каналы + сообщения append в БД + API)** | ✅ **DONE** (2026-10-27, 166 tests, clippy 0, коммит `89b7b39`, pushed) |
+| **Wave 2.2 (чат в UI: пост + список + пагинация + live)** | ✅ **DONE** (2026-10-30, 170 tests, clippy 0, svelte-check 0, vite build OK, проверено в браузере) |
 
 ## Wave 0 — что сделано (принято)
 - Cargo-воркспейс: `besedka-core` (типы users/roles/rooms) · `besedka-infra` (rusqlite bundled + refinery) · `besedka-app` (axum + бинарник).
@@ -70,6 +71,19 @@ _Обновлено: 2026-10-27 · Source of truth «где мы»._
 - **Гейты:** `cargo build` OK · `cargo test --workspace` — **166 passed / 0 failed** · `cargo clippy --all-targets -- -D warnings` — **0** · UI в срезе не менялся → npm-гейты не требовались.
 - **Commit:** `89b7b39` — `feat(messages): Wave 2.1 — channels + messages append (core+infra+api)`, pushed в origin/main.
 
+## Wave 2.2 — что сделано (принято)
+- **APP (бэкенд, минимально):** `GET /api/v1/users` (AuthedUser) → `{"users":[{"id","display_name"},...]}` — каталог пользователей для имён отправителей (пригодится и в 2.3). Инфра: `Db::list_users()` (`SELECT id, display_name FROM users ORDER BY display_name`); `display_name` падает на `username`, если не задан (DB-слой) — т.е. для парольных регистраций имя = логин, реальное ФИО даёт только AD/SSO.
+- **UI (главная часть):** новый компонент `ui/src/lib/components/RoomChat.svelte` + секция чата в `App.svelte`:
+  - клик по комнате → заголовок (название + бейдж вида) + список сообщений (имя отправителя, время, текст).
+  - Имена: `fetchUsers()` один раз после логина (карта id→display_name), своя — «Вы»; **live-обновление каталога**: при каждом тике поллинга, если в новых сообщениях есть незнакомный sender_id — каталог перечитывается (иначе новый участник показывался бы как «Пользователь #N» до перезагрузки).
+  - Ввод: поле + Enter/кнопка, trim, пустое не шлём; после 201 сообщение добавляется в список (дубликаты по id исключены).
+  - Пагинация: свежие 50; если их ровно 50 — кнопка «Загрузить ещё» (`before_id` = id самого старшего в списке); счётчик сохранён, скролл не прыгает (новые — сверху, при скролле вниз).
+  - Live: поллинг `GET /rooms/{id}/messages?limit=…&before_id=<новейшее id>` каждые 3 с (только пока чат открыт и вкладка видна — `visibilitychange`); новые сообщения вставляются сверху.
+  - `api.ts`: тип `Message`, `listMessages(roomId, limit?, beforeId?)`, `postMessage(roomId, text)`, `fetchUsers()`.
+- **Тесты (браузер, живой):** 50 сообщений в комнате, «Загрузить ещё» подтягивает старшие; чужой пост (фин, зарегистрирован ПОСЛЕ логина наблюдателя) появляется через ~3 с без перезагрузки, имя — из каталога (username-fallback), не «Пользователь #8»; свой пост — сверху, без дублей.
+- **Гейты:** `cargo test --workspace` — **170 passed / 0 failed** (app 69, core 12, infra 89; +4 новых: `list_users` + HTTP `GET /users`) · `cargo clippy --all-targets -- -D warnings` — **0** · `cargo fmt --check` — чистый · `npm run check` (svelte-check) — **0 errors** · `npm run build` (vite) — **OK** · живой браузер: сценарий выше пройден.
+- **Commit:** (см. ниже) — `feat(chat): Wave 2.2 — room chat UI (post + list + pagination + live polling) + users catalog`, pushed в origin/main.
+
 ## Дальше
 **WAVE 1 (аутентификация + комнаты) — ✅ ПОЛНОСТЬЮ ЗАВЕРШЕНА** (2026-10-27):
 1. **1.1 ✅** register/login/logout/me (argon2) + сессии + `users`/`roles` в core.
@@ -78,7 +92,7 @@ _Обновлено: 2026-10-27 · Source of truth «где мы»._
 
 **WAVE 2 (сообщения) — начата:**
 1. **2.1 ✅** Каналы + сообщения (append) в БД (core + infra + API) — см. секцию выше (коммит `89b7b39`).
-2. **2.2 →** [app+ui] Пост/список сообщений (WS или поллинг) + пагинация. **Accept:** обмен в UI.
+2. **2.2 ✅** Чат в UI: пост + список + пагинация + live (поллинг) + каталог `GET /users` — см. секцию выше (2026-10-30).
 3. **2.3 →** [app+ui] Edit/delete своего сообщения + read receipts. (поэтому в 2.1 полей `edited_at`/`deleted_by` нет).
 
 ## Указатели контекста
