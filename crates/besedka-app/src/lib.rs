@@ -14,7 +14,7 @@ pub mod http;
 
 use std::sync::Arc;
 
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::Router;
 use besedka_infra::Db;
 use time::Duration;
@@ -62,6 +62,19 @@ pub fn app(db: Arc<Db>, sessions: SessionsConfig, ad: AdRuntime) -> Router {
         .route(
             "/api/v1/rooms/{id}/messages",
             post(http::post_message).get(http::list_messages),
+        )
+        // Wave 2.3 — edit (PATCH) and delete (DELETE) a message: authors only.
+        // Any other method on this path is answered 405 by the router.
+        .route(
+            "/api/v1/rooms/{id}/messages/{message_id}",
+            patch(http::edit_message).delete(http::delete_message),
+        )
+        // Wave 2.3 — read receipts: mark the room read (members) and the
+        // per-message reader list (members).
+        .route("/api/v1/rooms/{id}/read", post(http::mark_read))
+        .route(
+            "/api/v1/rooms/{id}/messages/{message_id}/readers",
+            get(http::message_readers),
         )
         .route("/api/v1/register", post(http::register))
         .route("/api/v1/login", post(http::login))
@@ -193,7 +206,12 @@ mod tests {
         let bytes = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body");
-        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        // Empty bodies (e.g. 204 No Content) are not JSON — report them as null.
+        let value: serde_json::Value = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).expect("json")
+        };
         (status, value, headers)
     }
 
@@ -1381,5 +1399,330 @@ mod tests {
         let (status, body, _) = req(&router, "GET", "/api/v1/users", None, None).await;
         assert_eq!(status, 401);
         assert_eq!(body["error"], "not logged in");
+    }
+
+    // ---------- Wave 2.4: edit (PATCH) and delete (DELETE) own messages ----------
+
+    #[tokio::test]
+    async fn edit_and_delete_message_author_only() {
+        let db = test_db();
+        let room_id = db.create_room(RoomKind::Channel, "obshchii").expect("room");
+        let router = test_app(db);
+
+        let author = logged_in(&router, "author").await;
+        let other = logged_in(&router, "other").await;
+        for cookie in [&author, &other] {
+            req(
+                &router,
+                "POST",
+                &format!("/api/v1/rooms/{room_id}/join"),
+                None,
+                Some(cookie),
+            )
+            .await;
+        }
+
+        // Author posts a message; a fresh one has no edited_at stamp.
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/messages"),
+            Some(serde_json::json!({ "text": "pervoe" })),
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 201);
+        let msg_id = body["message"]["id"].as_i64().unwrap();
+        assert!(body["message"]["edited_at"].is_null(), "fresh: {body}");
+
+        // Author edits: 200, new text, RFC 3339 UTC stamp with millis + 'Z'.
+        let (status, body, _) = req(
+            &router,
+            "PATCH",
+            &format!("/api/v1/rooms/{room_id}/messages/{msg_id}"),
+            Some(serde_json::json!({ "text": "vtoroe" })),
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["message"]["text"], "vtoroe");
+        let edited = body["message"]["edited_at"]
+            .as_str()
+            .expect("edited_at stamp")
+            .to_string();
+        assert_eq!(edited.len(), 24, "RFC 3339 with millis: {edited}");
+        assert!(edited.ends_with('Z'), "UTC: {edited}");
+
+        // A member who did NOT write it cannot edit (403, author-only wording).
+        let (status, body, _) = req(
+            &router,
+            "PATCH",
+            &format!("/api/v1/rooms/{room_id}/messages/{msg_id}"),
+            Some(serde_json::json!({ "text": "chuzhoe" })),
+            Some(&other),
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert!(
+            body["error"].as_str().unwrap().contains("own"),
+            "body: {body}"
+        );
+        // ...and the text is untouched.
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages"),
+            None,
+            Some(&other),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["messages"][0]["text"], "vtoroe");
+
+        // Empty text is rejected like on POST (400).
+        let (status, _, _) = req(
+            &router,
+            "PATCH",
+            &format!("/api/v1/rooms/{room_id}/messages/{msg_id}"),
+            Some(serde_json::json!({ "text": "   " })),
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 400);
+
+        // Unknown message -> 404 (room exists, message does not).
+        let (status, _, _) = req(
+            &router,
+            "PATCH",
+            &format!("/api/v1/rooms/{room_id}/messages/999999"),
+            Some(serde_json::json!({ "text": "privet" })),
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 404);
+
+        // Author deletes: 204, and the room's list is empty afterwards.
+        let (status, _, _) = req(
+            &router,
+            "DELETE",
+            &format!("/api/v1/rooms/{room_id}/messages/{msg_id}"),
+            None,
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages"),
+            None,
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            body["messages"].as_array().unwrap().is_empty(),
+            "body: {body}"
+        );
+
+        // A member who did NOT write it cannot delete (403).
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/messages"),
+            Some(serde_json::json!({ "text": "eshche" })),
+            Some(&other),
+        )
+        .await;
+        assert_eq!(status, 201);
+        let other_msg_id = body["message"]["id"].as_i64().unwrap();
+        let (status, body, _) = req(
+            &router,
+            "DELETE",
+            &format!("/api/v1/rooms/{room_id}/messages/{other_msg_id}"),
+            None,
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert!(
+            body["error"].as_str().unwrap().contains("own"),
+            "body: {body}"
+        );
+
+        // Unknown message DELETE -> 404.
+        let (status, _, _) = req(
+            &router,
+            "DELETE",
+            &format!("/api/v1/rooms/{room_id}/messages/999999"),
+            None,
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 404);
+
+        // Any other method on the message path -> 405.
+        let (status, _, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/messages/{other_msg_id}"),
+            Some(serde_json::json!({})),
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 405);
+    }
+
+    // ---------- Wave 2.3: read receipts (mark read + readers) ----------
+
+    #[tokio::test]
+    async fn mark_read_and_readers_flow() {
+        let db = test_db();
+        let room_id = db.create_room(RoomKind::Channel, "obshchii").expect("room");
+        let router = test_app(db.clone());
+
+        let author = logged_in(&router, "author").await;
+        let other = logged_in(&router, "other").await;
+        // A logged-in user who never joins the room.
+        let stranger = logged_in(&router, "stranger").await;
+        let other_uid = db
+            .list_users()
+            .unwrap()
+            .iter()
+            .find(|(_, name)| name == "other")
+            .map(|(id, _)| *id)
+            .expect("user 'other' exists");
+        for cookie in [&author, &other] {
+            req(
+                &router,
+                "POST",
+                &format!("/api/v1/rooms/{room_id}/join"),
+                None,
+                Some(cookie),
+            )
+            .await;
+        }
+
+        // Empty room: member marks read → 200 with last_read_id 0.
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/read"),
+            None,
+            Some(&other),
+        )
+        .await;
+        assert_eq!(status, 200, "empty room mark_read: {body}");
+        assert_eq!(body["last_read_id"], 0);
+
+        // Non-member → 403 (even though they're logged in).
+        let (status, _, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/read"),
+            None,
+            Some(&stranger),
+        )
+        .await;
+        assert_eq!(status, 403);
+        // Unknown room → 404.
+        let (status, _, _) = req(
+            &router,
+            "POST",
+            "/api/v1/rooms/999999/read",
+            None,
+            Some(&other),
+        )
+        .await;
+        assert_eq!(status, 404);
+
+        // Author posts two messages; nobody has read them yet.
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/messages"),
+            Some(serde_json::json!({ "text": "pervoe" })),
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 201);
+        let m1 = body["message"]["id"].as_i64().unwrap();
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/messages"),
+            Some(serde_json::json!({ "text": "vtoroe" })),
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 201);
+        let m2 = body["message"]["id"].as_i64().unwrap();
+
+        // Readers before anyone marks read → empty users array.
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages/{m1}/readers"),
+            None,
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["users"].as_array().unwrap().len(), 0, "body: {body}");
+
+        // Other member marks the room read → cursor = m2 (the newest), so
+        // BOTH messages are now read by them.
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/read"),
+            None,
+            Some(&other),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["last_read_id"], m2, "body: {body}");
+
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages/{m1}/readers"),
+            None,
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["users"][0]["id"], other_uid);
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages/{m2}/readers"),
+            None,
+            Some(&other),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["users"].as_array().unwrap().len(), 1, "body: {body}");
+
+        // Non-member → 403, unknown message → 404 (room exists, member is
+        // the author).
+        let (status, _, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages/{m1}/readers"),
+            None,
+            Some(&stranger),
+        )
+        .await;
+        assert_eq!(status, 403);
+        let (status, _, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages/999999/readers"),
+            None,
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 404);
     }
 }

@@ -29,13 +29,16 @@ export interface SsoStatus {
   password_login: boolean;
 }
 
-/** A chat message (Wave 2.1). `created_at` is RFC 3339 UTC, milliseconds. */
+/** A chat message (Wave 2.1). `created_at` is RFC 3339 UTC, milliseconds.
+ *  `edited_at` (Wave 2.3) is set by the server on every edit — null while
+ *  the message has never been edited. */
 export interface Message {
   id: number;
   room_id: number;
   sender_id: number;
   text: string;
   created_at: string;
+  edited_at?: string | null;
 }
 
 /** A user from the catalog endpoint (Wave 2.2) — enough to name senders. */
@@ -91,6 +94,8 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     }
     throw new ApiError(res.status, message);
   }
+  // 204 No Content (e.g. DELETE) has an empty body — nothing to parse.
+  if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
 
@@ -167,6 +172,42 @@ export function listMessages(roomId: number, limit?: number, beforeId?: number):
 export function postMessage(roomId: number, text: string): Promise<Message> {
   return request<MessageEnvelope>(`/api/v1/rooms/${roomId}/messages`, jsonInit("POST", { text })).then(
     (r) => r.message,
+  );
+}
+
+// ----- Wave 2.3: edit + delete own messages ----
+
+/** Edit the text of one of YOUR OWN messages (403 otherwise). Same
+ *  validation as a new message (1–4096 chars after trimming). Returns the
+ *  updated message with a fresh `edited_at` stamp. */
+export function editMessage(roomId: number, messageId: number, text: string): Promise<Message> {
+  return request<MessageEnvelope>(
+    `/api/v1/rooms/${roomId}/messages/${messageId}`,
+    jsonInit("PATCH", { text }),
+  ).then((r) => r.message);
+}
+
+/** Delete one of YOUR OWN messages (403 otherwise). 204, empty body. */
+export function deleteMessage(roomId: number, messageId: number): Promise<void> {
+  return request(`/api/v1/rooms/${roomId}/messages/${messageId}`, { method: "DELETE" }).then(
+    () => undefined,
+  );
+}
+
+// ----- Wave 2.3: read receipts ----
+
+/** Mark the room as read (members only): the cursor jumps to the latest
+ *  message (or 0 for an empty room). Returns the new cursor. */
+export function markRoomRead(roomId: number): Promise<number> {
+  return request<{ last_read_id: number }>(`/api/v1/rooms/${roomId}/read`, {
+    method: "POST",
+  }).then((r) => r.last_read_id);
+}
+
+/** Who has read a given message (members only): `{ id, display_name }` list. */
+export function messageReaders(roomId: number, messageId: number): Promise<UserRef[]> {
+  return request<UsersResponse>(`/api/v1/rooms/${roomId}/messages/${messageId}/readers`).then(
+    (r) => r.users,
   );
 }
 

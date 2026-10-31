@@ -379,7 +379,7 @@ impl Db {
     pub fn get_message(&self, id: i64) -> Result<Option<Message>, DbError> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, room_id, sender_id, text, created_at FROM messages WHERE id = ?1",
+            "SELECT id, room_id, sender_id, text, created_at, edited_at FROM messages WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], message_row)?;
         match rows.next() {
@@ -409,7 +409,7 @@ impl Db {
         let limit = limit.clamp(1, 200);
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, room_id, sender_id, text, created_at
+            "SELECT id, room_id, sender_id, text, created_at, edited_at
              FROM messages
              WHERE room_id = ?1 AND (?2 IS NULL OR id < ?2)
              ORDER BY id DESC
@@ -422,6 +422,113 @@ impl Db {
         page.reverse(); // DESC (fetch) → ASC (render oldest → newest)
         Ok(page)
     }
+
+    /// Edit a message's text and stamp `edited_at`. The timestamp is
+    /// generated in SQL with the SAME `strftime` expression as the
+    /// `created_at` column default (`%Y-%m-%dT%H:%M:%fZ` — RFC 3339 UTC with
+    /// milliseconds), so both fields always share one byte-identical format.
+    ///
+    /// Only the "does the row exist?" check is enforced here — "is the
+    /// author allowed?" is the app layer's job (HTTP 403).
+    ///
+    /// Wave 2.4: the author may edit their own message any number of times;
+    /// `edited_at` always reflects the LAST edit.
+    pub fn update_message_text(&self, id: i64, text: &str) -> Result<(), DbError> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let updated = conn.execute(
+            "UPDATE messages
+             SET text = ?2,
+                 edited_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?1",
+            (id, text),
+        )?;
+        if updated == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Delete a message row (hard delete). `NotFound` when the id does not
+    /// exist.
+    pub fn delete_message(&self, id: i64) -> Result<(), DbError> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let deleted = conn.execute("DELETE FROM messages WHERE id = ?1", [id])?;
+        if deleted == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
+    }
+
+    // ----- Wave 2.3: read cursors (read receipts) -----
+
+    /// The newest message id in the room, or `None` when the room has no
+    /// messages.
+    pub fn latest_message_id(&self, room_id: i64) -> Result<Option<i64>, DbError> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.query_row(
+            "SELECT MAX(id) FROM messages WHERE room_id = ?1",
+            [room_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(DbError::from)
+    }
+
+    /// The user's current read cursor for the room (`None` = never read).
+    pub fn get_read_cursor(&self, room_id: i64, user_id: i64) -> Result<Option<i64>, DbError> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        match conn.query_row(
+            "SELECT last_read_id FROM room_read_cursors WHERE room_id = ?1 AND user_id = ?2",
+            (room_id, user_id),
+            |row| row.get(0),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Set (or bump) the user's read cursor. UPSERT with `MAX`: the stored
+    /// cursor never moves backwards, so an older poll arriving late can't
+    /// roll the receipt state back.
+    pub fn set_read_cursor(
+        &self,
+        room_id: i64,
+        user_id: i64,
+        last_read_id: i64,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "INSERT INTO room_read_cursors (room_id, user_id, last_read_id)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (room_id, user_id) DO UPDATE SET
+                 last_read_id = MAX(last_read_id, excluded.last_read_id)",
+            (room_id, user_id, last_read_id),
+        )?;
+        Ok(())
+    }
+
+    /// Who has read a given message: room members whose cursor is at or past
+    /// the message id, as `(user_id, display_name)` pairs sorted by name
+    /// (`display_name` falls back to `username`, same as the user catalog).
+    pub fn message_readers(
+        &self,
+        room_id: i64,
+        message_id: i64,
+    ) -> Result<Vec<(i64, String)>, DbError> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT u.id, COALESCE(u.display_name, u.username)
+             FROM room_read_cursors rc
+             JOIN room_members rm ON rm.room_id = rc.room_id AND rm.user_id = rc.user_id
+             JOIN users u ON u.id = rc.user_id
+             WHERE rc.room_id = ?1 AND rc.last_read_id >= ?2
+             ORDER BY COALESCE(u.display_name, u.username)",
+        )?;
+        let rows = stmt
+            .query_map((room_id, message_id), |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 }
 
 /// Message query row.
@@ -432,6 +539,8 @@ fn message_row(row: &rusqlite::Row) -> rusqlite::Result<Message> {
         sender_id: row.get(2)?,
         text: row.get(3)?,
         created_at: row.get(4)?,
+        // Wave 2.4: nullable column; NULL = never edited.
+        edited_at: row.get::<_, Option<String>>(5)?,
     })
 }
 
@@ -753,6 +862,157 @@ mod tests {
 
         // Unknown id → None, not an error.
         assert!(db.get_message(999_999).unwrap().is_none());
+    }
+
+    #[test]
+    fn update_message_text_sets_text_and_edited_at() {
+        let db = Db::open_in_memory().unwrap();
+        let alice = db.create_user("alice", None, Role::User, None).unwrap();
+        let room = db.create_room(RoomKind::Channel, "#dev").unwrap();
+
+        let id = db.create_message(room, alice, "первое").unwrap();
+        // Fresh messages are never edited: NULL in the DB → None in the struct.
+        assert!(db.get_message(id).unwrap().unwrap().edited_at.is_none());
+
+        db.update_message_text(id, "второе").unwrap();
+        let msg = db.get_message(id).unwrap().expect("still exists");
+        assert_eq!(msg.text, "второе");
+        // Timestamp shape: RFC 3339 UTC with milliseconds
+        // (e.g. "2026-10-31T12:00:00.123Z", 24 chars) — same as created_at.
+        let edited = msg.edited_at.expect("edited_at must be stamped");
+        assert_eq!(edited.len(), 24, "unexpected edited_at shape: {edited}");
+        assert!(
+            edited.ends_with('Z') && edited.as_bytes()[10] == b'T',
+            "unexpected edited_at shape: {edited}"
+        );
+
+        // Re-edit: text updates again, edited_at stays stamped.
+        db.update_message_text(id, "третье").unwrap();
+        let msg = db.get_message(id).unwrap().unwrap();
+        assert_eq!(msg.text, "третье");
+        assert!(msg.edited_at.is_some());
+
+        // Unknown id → NotFound (the app layer maps it to HTTP 404).
+        assert!(db.update_message_text(999_999, "x").is_err());
+    }
+
+    #[test]
+    fn delete_message_removes_the_row() {
+        let db = Db::open_in_memory().unwrap();
+        let alice = db.create_user("alice", None, Role::User, None).unwrap();
+        let room = db.create_room(RoomKind::Channel, "#dev").unwrap();
+
+        let id = db.create_message(room, alice, "удали меня").unwrap();
+        assert!(db.get_message(id).unwrap().is_some());
+
+        db.delete_message(id).unwrap();
+        assert!(
+            db.get_message(id).unwrap().is_none(),
+            "deleted message must be gone"
+        );
+        assert_eq!(db.list_messages(room, 50, None).unwrap().len(), 0);
+
+        // Double delete → NotFound, not a panic.
+        assert!(db.delete_message(id).is_err());
+    }
+
+    // ----- Wave 2.3: read cursors (read receipts) -----
+
+    #[test]
+    fn latest_message_id_none_for_empty_room_some_for_posted() {
+        let db = Db::open_in_memory().unwrap();
+        let alice = db.create_user("alice", None, Role::User, None).unwrap();
+        let room = db.create_room(RoomKind::Channel, "#dev").unwrap();
+
+        assert_eq!(
+            db.latest_message_id(room).unwrap(),
+            None,
+            "empty room → None"
+        );
+
+        let id = db.create_message(room, alice, "first").unwrap();
+        assert_eq!(db.latest_message_id(room).unwrap(), Some(id));
+    }
+
+    #[test]
+    fn set_read_cursor_inserts_then_bumps_never_regresses() {
+        let db = Db::open_in_memory().unwrap();
+        let alice = db.create_user("alice", None, Role::User, None).unwrap();
+        let bob = db.create_user("bob", None, Role::User, None).unwrap();
+        let room = db.create_room(RoomKind::Channel, "#dev").unwrap();
+        db.join_room(room, alice).unwrap();
+        db.join_room(room, bob).unwrap();
+
+        // No cursor yet → None.
+        assert_eq!(db.get_read_cursor(room, alice).unwrap(), None);
+
+        // First set inserts.
+        db.set_read_cursor(room, alice, 5).unwrap();
+        assert_eq!(db.get_read_cursor(room, alice).unwrap(), Some(5));
+
+        // Bigger value wins…
+        db.set_read_cursor(room, alice, 9).unwrap();
+        assert_eq!(db.get_read_cursor(room, alice).unwrap(), Some(9));
+
+        // …smaller value does NOT regress the cursor.
+        db.set_read_cursor(room, alice, 3).unwrap();
+        assert_eq!(
+            db.get_read_cursor(room, alice).unwrap(),
+            Some(9),
+            "cursors only move forward"
+        );
+
+        // Bob's cursor is independent.
+        assert_eq!(db.get_read_cursor(room, bob).unwrap(), None);
+        db.set_read_cursor(room, bob, 2).unwrap();
+        assert_eq!(db.get_read_cursor(room, bob).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn message_readers_lists_members_past_the_message_sorted_by_name() {
+        let db = Db::open_in_memory().unwrap();
+        let anna = db
+            .create_user("anna", Some("Anna"), Role::User, None)
+            .unwrap();
+        let bob = db
+            .create_user("bob", Some("Bob"), Role::User, None)
+            .unwrap();
+        let carol = db
+            .create_user("carol", Some("Carol"), Role::User, None)
+            .unwrap();
+        let room = db.create_room(RoomKind::Channel, "#dev").unwrap();
+        db.join_room(room, anna).unwrap();
+        db.join_room(room, bob).unwrap();
+        db.join_room(room, carol).unwrap();
+
+        let m1 = db.create_message(room, anna, "hello").unwrap();
+        let m2 = db.create_message(room, anna, "world").unwrap();
+
+        // Nobody read yet → no readers.
+        assert!(db.message_readers(room, m1).unwrap().is_empty());
+
+        // Bob read up to m1: sees m1, not m2.
+        db.set_read_cursor(room, bob, m1).unwrap();
+        let readers = db.message_readers(room, m1).unwrap();
+        assert_eq!(readers, vec![(bob, "Bob".to_string())]);
+        assert!(db.message_readers(room, m2).unwrap().is_empty());
+
+        // Carol read up to m2 → she has read BOTH m1 and m2. Bob only read
+        // up to m1, so he appears for m1 but not for m2.
+        db.set_read_cursor(room, carol, m2).unwrap();
+        assert_eq!(
+            db.message_readers(room, m2).unwrap(),
+            vec![(carol, "Carol".to_string())]
+        );
+        assert_eq!(
+            db.message_readers(room, m1).unwrap(),
+            vec![(bob, "Bob".to_string()), (carol, "Carol".to_string())]
+        );
+
+        // A non-member who somehow has a cursor is excluded by the join.
+        let outsider = db.create_user("outsider", None, Role::User, None).unwrap();
+        db.set_read_cursor(room, outsider, 999).unwrap();
+        assert_eq!(db.message_readers(room, m2).unwrap().len(), 1);
     }
 
     #[test]

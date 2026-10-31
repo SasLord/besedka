@@ -1,7 +1,15 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
-  import { ApiError, listMessages, postMessage } from "../api";
-  import type { Message, Room } from "../api";
+  import {
+    ApiError,
+    deleteMessage,
+    editMessage,
+    listMessages,
+    markRoomRead,
+    messageReaders,
+    postMessage,
+  } from "../api";
+  import type { Message, Room, UserRef } from "../api";
 
   let {
     room,
@@ -58,6 +66,8 @@
       messages = page;
       hasMore = page.length === PAGE;
       onNewMessages?.(page);
+      markRead();
+      void refreshReadReceipts();
     } catch (e) {
       error = toMessage(e);
     } finally {
@@ -107,6 +117,8 @@
   async function poll() {
     try {
       appendNew(await listMessages(room.id, PAGE));
+      markRead();
+      void refreshReadReceipts();
     } catch {
       // Best effort: a hiccup must not spam the error banner every 5s.
     }
@@ -123,12 +135,109 @@
         messages = [...messages, stored];
       }
       draft = "";
+      markRead();
       void tick().then(scrollBottom);
     } catch (e) {
       error = toMessage(e);
     } finally {
       sending = false;
     }
+  }
+
+  // ----- Wave 2.3: edit + delete own messages -----
+  let editingId = $state<number | null>(null);
+  let editDraft = $state("");
+  let saving = $state(false);
+  let editInputEl: HTMLInputElement | undefined = $state();
+  /** Two-click delete: the message whose «Удалить» turned into «Точно?». */
+  let confirmDeleteId = $state<number | null>(null);
+  let confirmDeleteTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function startEdit(m: Message) {
+    if (editingId !== null) return; // one editor at a time
+    // A pending «Точно?» from before must not survive the switch to edit mode.
+    if (confirmDeleteTimer !== undefined) clearTimeout(confirmDeleteTimer);
+    confirmDeleteId = null;
+    editingId = m.id;
+    editDraft = m.text;
+    void tick().then(() => {
+      editInputEl?.focus();
+      editInputEl?.select();
+    });
+  }
+
+  function cancelEdit() {
+    editingId = null;
+    editDraft = "";
+  }
+
+  async function saveEdit(m: Message) {
+    const text = editDraft.trim();
+    if (!text || saving) return;
+    saving = true;
+    error = null;
+    try {
+      const updated = await editMessage(room.id, m.id, text);
+      messages = messages.map((x) => (x.id === updated.id ? updated : x));
+      cancelEdit();
+    } catch (e) {
+      error = toMessage(e);
+    } finally {
+      saving = false;
+    }
+  }
+
+  /** First click on «Удалить»: arm the confirmation («Точно?»), auto-resets in 3 s. */
+  function armDelete(m: Message) {
+    if (confirmDeleteId === m.id) return; // already armed — second click deletes
+    confirmDeleteId = m.id;
+    if (confirmDeleteTimer !== undefined) clearTimeout(confirmDeleteTimer);
+    confirmDeleteTimer = setTimeout(() => (confirmDeleteId = null), 3000);
+  }
+
+  async function remove(m: Message) {
+    if (confirmDeleteTimer !== undefined) clearTimeout(confirmDeleteTimer);
+    confirmDeleteId = null;
+    error = null;
+    try {
+      await deleteMessage(room.id, m.id);
+      messages = messages.filter((x) => x.id !== m.id);
+    } catch (e) {
+      error = toMessage(e);
+    }
+  }
+
+  // ----- Wave 2.3: read receipts (read marks) -----
+  /** msg id -> who has read it (fetched lazily, refreshed while the room is open). */
+  let readersById = $state(new Map<number, UserRef[]>());
+  let expandedReadId = $state<number | null>(null);
+
+  /** The room is open = everything up to now is read. Best effort. */
+  function markRead() {
+    void markRoomRead(room.id).catch(() => {
+      /* not a member or a hiccup — the chat itself must not break */
+    });
+  }
+
+  /** Fetch the reader lists of my messages (newest first, capped at 20). */
+  async function refreshReadReceipts() {
+    const mine = messages.filter((m) => m.sender_id === meId).slice(0, 20);
+    if (!mine.length) return;
+    const settled = await Promise.allSettled(mine.map((m) => messageReaders(room.id, m.id)));
+    const next = new Map(readersById);
+    settled.forEach((res, i) => {
+      if (res.status === "fulfilled") next.set(mine[i].id, res.value);
+    });
+    readersById = next;
+  }
+
+  function toggleReaders(m: Message) {
+    if (expandedReadId === m.id) {
+      expandedReadId = null;
+      return;
+    }
+    expandedReadId = m.id;
+    if (!readersById.has(m.id)) void refreshReadReceipts();
   }
 
   const KIND_LABEL: Record<Room["kind"], string> = {
@@ -163,6 +272,7 @@
 
   onDestroy(() => {
     if (pollTimer !== undefined) clearInterval(pollTimer);
+    if (confirmDeleteTimer !== undefined) clearTimeout(confirmDeleteTimer);
   });
 </script>
 
@@ -197,8 +307,76 @@
         <div class="msg__meta">
           <span class="msg__sender">{m.sender_id === meId ? "Вы" : userName(m.sender_id)}</span>
           <span class="msg__time">{fmtTime(m.created_at)}</span>
+          {#if m.edited_at}<span class="msg__edited">(изменено)</span>{/if}
+          {#if m.sender_id === meId}
+            <button
+              class="msg__read"
+              type="button"
+              title="Кто прочитал"
+              onclick={() => toggleReaders(m)}
+            >
+              ✓ {readersById.get(m.id)?.length ?? "…"}
+            </button>
+          {/if}
         </div>
-        <div class="msg__text">{m.text}</div>
+        {#if editingId === m.id}
+          <div class="msg__edit">
+            <input
+              class="msg__edit-input"
+              type="text"
+              bind:value={editDraft}
+              bind:this={editInputEl}
+              maxlength={4096}
+              onkeydown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void saveEdit(m);
+                } else if (e.key === "Escape") {
+                  cancelEdit();
+                }
+              }}
+            />
+            <div class="msg__edit-actions">
+              <button
+                class="msg__btn"
+                type="button"
+                disabled={saving || !editDraft.trim()}
+                onclick={() => void saveEdit(m)}
+              >
+                {saving ? "Сохранение…" : "Сохранить"}
+              </button>
+              <button class="msg__btn" type="button" disabled={saving} onclick={cancelEdit}>
+                Отмена
+              </button>
+            </div>
+          </div>
+        {:else}
+          <div class="msg__text">{m.text}</div>
+          {#if m.sender_id === meId && expandedReadId === m.id}
+            <div class="msg__readers">
+              {#if readersById.has(m.id)}
+                Прочитали: {readersById.get(m.id)?.map((u) => u.display_name).join(", ") || "пока никто"}
+              {:else}
+                Загружаю…
+              {/if}
+            </div>
+          {/if}
+          {#if m.sender_id === meId}
+            <div class="msg__actions">
+              <button class="msg__btn" type="button" title="Изменить текст" onclick={() => startEdit(m)}>
+                ✎ Изменить
+              </button>
+              <button
+                class="msg__btn msg__btn--danger"
+                type="button"
+                title={confirmDeleteId === m.id ? "Нажмите ещё раз, чтобы удалить" : "Удалить сообщение"}
+                onclick={() => (confirmDeleteId === m.id ? void remove(m) : armDelete(m))}
+              >
+                {confirmDeleteId === m.id ? "⚠ Точно?" : "🗑 Удалить"}
+              </button>
+            </div>
+          {/if}
+        {/if}
       </div>
     {/each}
   </div>
@@ -334,6 +512,94 @@
   .msg__time {
     font-size: 11px;
     color: var(--color-text-muted);
+  }
+
+  .msg__edited {
+    font-size: 11px;
+    font-style: italic;
+    color: var(--color-text-muted);
+  }
+
+  .msg__read {
+    padding: 0;
+    font-size: 11px;
+    color: var(--color-text-muted);
+    background: transparent;
+    border: none;
+    cursor: pointer;
+  }
+
+  .msg__read:hover {
+    color: var(--color-accent);
+  }
+
+  .msg__readers {
+    font-size: 11px;
+    color: var(--color-text-muted);
+    text-align: right;
+  }
+
+  .msg__actions {
+    display: none;
+    gap: var(--space-2);
+  }
+
+  .msg.mine:hover .msg__actions,
+  .msg.mine:focus-within .msg__actions {
+    display: flex;
+  }
+
+  .msg__btn {
+    padding: 2px var(--space-2);
+    font-size: 11px;
+    color: var(--color-text-muted);
+    background: transparent;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+  }
+
+  .msg__btn:hover {
+    color: var(--color-text);
+    background: var(--color-accent-soft);
+  }
+
+  .msg__btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+
+  .msg__btn--danger:hover {
+    color: var(--color-danger);
+    border-color: var(--color-danger);
+    background: transparent;
+  }
+
+  .msg__edit {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .msg__edit-input {
+    width: 100%;
+    padding: var(--space-1) var(--space-2);
+    font: inherit;
+    color: var(--color-text);
+    background: var(--color-bg);
+    border: 1px solid var(--color-accent);
+    border-radius: var(--radius-md);
+  }
+
+  .msg__edit-input:focus {
+    outline: 2px solid var(--color-accent);
+    outline-offset: -1px;
+  }
+
+  .msg__edit-actions {
+    display: flex;
+    gap: var(--space-2);
+    justify-content: flex-end;
   }
 
   .msg__text {

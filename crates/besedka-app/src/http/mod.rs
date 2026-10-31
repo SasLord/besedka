@@ -125,6 +125,13 @@ pub struct UsersResponse {
     users: Vec<UserDto>,
 }
 
+/// `POST /api/v1/rooms/{id}/read` response — the room's newest message id
+/// the caller has now read (Wave 2.3 read receipts).
+#[derive(Debug, Serialize)]
+pub struct ReadResponse {
+    last_read_id: i64,
+}
+
 // ----- Wave 2.1: rooms (creation) + messages (append-only) -----
 
 /// `kind` is `"room"` or `"channel"` (see `RoomKind`); `title` is 1–128
@@ -143,6 +150,13 @@ pub struct RoomResponse {
 /// `text` is 1–4096 characters after trimming.
 #[derive(Debug, serde::Deserialize)]
 pub struct PostMessageRequest {
+    text: String,
+}
+
+/// `PATCH .../messages/{message_id}` body — same `text` rules as a new
+/// message (1–4096 chars after trimming).
+#[derive(Debug, serde::Deserialize)]
+pub struct EditMessageRequest {
     text: String,
 }
 
@@ -518,6 +532,168 @@ pub async fn list_messages(
         db.list_messages(room_id, limit, before_id)
     })
     .await
-    .map_err(|e| HttpError::internal(format!("background task failed: {e}")))??;
-    Ok(Json(MessagesResponse { messages }))
+    .map_err(|e| HttpError::internal(format!("background task failed: {e}")))?;
+    Ok(Json(MessagesResponse {
+        messages: messages?,
+    }))
+}
+
+/// `PATCH /api/v1/rooms/{id}/messages/{message_id}` — edit the text of a
+/// message the CURRENT USER wrote (authors only; anyone else gets 403).
+///
+/// 404 when the room or message does not exist, 403 for non-members and
+/// non-authors, 400 when `text` is empty or longer than 4096 characters
+/// after trimming (the same rules as `POST .../messages`). On success the
+/// updated message is returned; `edited_at` (RFC 3339 UTC with millis) is
+/// stamped by the DB on every edit and drives the «изменено» marker in the
+/// UI. Repeated edits are allowed — `edited_at` always shows the last one.
+pub async fn edit_message(
+    State(state): State<AppState>,
+    AuthedUser(user): AuthedUser,
+    Path((room_id, message_id)): Path<(i64, i64)>,
+    Json(payload): Json<EditMessageRequest>,
+) -> Result<Json<MessageResponse>, HttpError> {
+    let text = payload.text.trim().to_string();
+    if text.is_empty() {
+        return Err(HttpError::bad_request("text must not be empty"));
+    }
+    if text.chars().count() > 4096 {
+        return Err(HttpError::bad_request(
+            "text must be at most 4096 characters",
+        ));
+    }
+
+    let db = state.db.clone();
+    let user_id = user.id;
+    let message = tokio::task::spawn_blocking(move || -> Result<Message, HttpError> {
+        // Unknown room -> 404; non-member -> 403 (DbError::Forbidden).
+        if db.get_room(room_id)?.is_none() {
+            return Err(DbError::NotFound.into());
+        }
+        if !db.is_room_member(room_id, user_id)? {
+            return Err(DbError::Forbidden.into());
+        }
+        // Author-only: a member who did NOT write this message gets 403.
+        let existing = db.get_message(message_id)?.ok_or(DbError::NotFound)?;
+        if existing.sender_id != user_id {
+            return Err(HttpError::forbidden("you can only edit your own messages"));
+        }
+        db.update_message_text(message_id, &text)?;
+        db.get_message(message_id)?
+            .ok_or_else(|| HttpError::internal("message vanished"))
+    })
+    .await
+    .map_err(|e| HttpError::internal(format!("background task failed: {e}")))?;
+    Ok(Json(MessageResponse { message: message? }))
+}
+
+/// `DELETE /api/v1/rooms/{id}/messages/{message_id}` — delete a message the
+/// CURRENT USER wrote (authors only). Returns 204 No Content on success.
+///
+/// 404 when the room or message does not exist, 403 for non-members and
+/// non-authors. The row is removed (hard delete); the UI drops the message
+/// from its list and refetches to stay consistent.
+pub async fn delete_message(
+    State(state): State<AppState>,
+    AuthedUser(user): AuthedUser,
+    Path((room_id, message_id)): Path<(i64, i64)>,
+) -> Result<StatusCode, HttpError> {
+    let db = state.db.clone();
+    let user_id = user.id;
+    let deleted = tokio::task::spawn_blocking(move || -> Result<(), HttpError> {
+        // Unknown room -> 404; non-member -> 403 (DbError::Forbidden).
+        if db.get_room(room_id)?.is_none() {
+            return Err(DbError::NotFound.into());
+        }
+        if !db.is_room_member(room_id, user_id)? {
+            return Err(DbError::Forbidden.into());
+        }
+        // Author-only: a member who did NOT write this message gets 403.
+        let existing = db.get_message(message_id)?.ok_or(DbError::NotFound)?;
+        if existing.sender_id != user_id {
+            return Err(HttpError::forbidden(
+                "you can only delete your own messages",
+            ));
+        }
+        db.delete_message(message_id)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| HttpError::internal(format!("background task failed: {e}")))?;
+    deleted?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ----- Wave 2.3: read receipts (room read cursors) -----
+
+/// `POST /api/v1/rooms/{id}/read` — mark the room as read (members only).
+///
+/// Sets the caller's cursor to the room's newest message id and returns it:
+/// `200 {"last_read_id": N}`. For an empty room the cursor is left as-is and
+/// the response carries the current cursor (0 when never set).
+pub async fn mark_read(
+    State(state): State<AppState>,
+    AuthedUser(user): AuthedUser,
+    Path(room_id): Path<i64>,
+) -> Result<Json<ReadResponse>, HttpError> {
+    let db = state.db.clone();
+    let user_id = user.id;
+    let inner = tokio::task::spawn_blocking(move || -> Result<i64, HttpError> {
+        // Unknown room -> 404; non-member -> 403.
+        if db.get_room(room_id)?.is_none() {
+            return Err(DbError::NotFound.into());
+        }
+        if !db.is_room_member(room_id, user_id)? {
+            return Err(DbError::Forbidden.into());
+        }
+        // Newest message id, or the caller's existing cursor for an empty
+        // room (0 when they never read it) — the UPSERT never regresses.
+        let target = match db.latest_message_id(room_id)? {
+            Some(id) => id,
+            None => db.get_read_cursor(room_id, user_id)?.unwrap_or(0),
+        };
+        db.set_read_cursor(room_id, user_id, target)?;
+        Ok(target)
+    })
+    .await
+    .map_err(|e| HttpError::internal(format!("background task failed: {e}")))?;
+    let last_read_id = inner?;
+    Ok(Json(ReadResponse { last_read_id }))
+}
+
+/// `GET /api/v1/rooms/{id}/messages/{message_id}/readers` — who has read a
+/// message (members only).
+///
+/// Room members whose read cursor is at or past the message id, as
+/// `{"users":[{"id","display_name"},...]}` (same shape as `/api/v1/users`).
+pub async fn message_readers(
+    State(state): State<AppState>,
+    AuthedUser(user): AuthedUser,
+    Path((room_id, message_id)): Path<(i64, i64)>,
+) -> Result<Json<UsersResponse>, HttpError> {
+    let db = state.db.clone();
+    let user_id = user.id;
+    let inner = tokio::task::spawn_blocking(move || -> Result<Vec<(i64, String)>, HttpError> {
+        // Unknown room -> 404; non-member -> 403 (checked before the message
+        // so a stranger can't probe message ids across rooms).
+        if db.get_room(room_id)?.is_none() {
+            return Err(DbError::NotFound.into());
+        }
+        if !db.is_room_member(room_id, user_id)? {
+            return Err(DbError::Forbidden.into());
+        }
+        if db.get_message(message_id)?.is_none() {
+            return Err(DbError::NotFound.into());
+        }
+        Ok(db.message_readers(room_id, message_id)?)
+    })
+    .await
+    .map_err(|e| HttpError::internal(format!("background task failed: {e}")))?;
+    let readers = inner?;
+    Ok(Json(UsersResponse {
+        users: readers
+            .into_iter()
+            .map(|(id, display_name)| UserDto { id, display_name })
+            .collect(),
+    }))
 }

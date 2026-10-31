@@ -1,4 +1,4 @@
-//! Chat message (Wave 2.1: append-only; edit/delete arrive in Wave 2.3).
+//! Chat message (Wave 2.1 append-only; Wave 2.3 adds `edited_at` + deletion).
 
 use serde::{Deserialize, Serialize};
 
@@ -24,9 +24,11 @@ pub struct Message {
     pub text: String,
     /// Creation time, RFC 3339 UTC (millisecond precision) — see above.
     pub created_at: String,
-    // Wave 2.3 will add (NOT present in 2.1, do not add yet):
-    //   `edited_at: Option<String>` — set when the author edits their own message.
-    //   `deleted_by: Option<i64>`   — set when a message is removed (row kept as placeholder).
+    /// Last edit time, RFC 3339 UTC; `None` = never edited (the column is
+    /// nullable in the DB). Serialized as JSON `null` (see the wire
+    /// contract: `edited_at` is "ISO or null").
+    #[serde(default)]
+    pub edited_at: Option<String>,
 }
 
 #[cfg(test)]
@@ -40,6 +42,7 @@ mod tests {
             sender_id: 3,
             text: "привет".into(),
             created_at: "2026-10-27T16:31:20.123Z".into(),
+            edited_at: None,
         }
     }
 
