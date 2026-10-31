@@ -24,6 +24,7 @@ _Обновлено: 2026-10-30 · Source of truth «где мы»._
 | **Wave 1 (аутентификация + комнаты)** | ✅ **ПОЛНОСТЬЮ ЗАВЕРШЕНА** (2026-10-27, коммит `e5340ce`, pushed) |
 | **Wave 2.1 (каналы + сообщения append в БД + API)** | ✅ **DONE** (2026-10-27, 166 tests, clippy 0, коммит `89b7b39`, pushed) |
 | **Wave 2.2 (чат в UI: пост + список + пагинация + live)** | ✅ **DONE** (2026-10-30, 170 tests, clippy 0, svelte-check 0, vite build OK, проверено в браузере) |
+| **Wave 2.3 (edit/delete своих сообщений + read receipts)** | ✅ **DONE** (2026-10-31, 177 tests, clippy 0, svelte-check 0, vite build OK, end-to-end в браузере, коммит `a97e1ed`, pushed) |
 
 ## Wave 0 — что сделано (принято)
 - Cargo-воркспейс: `besedka-core` (типы users/roles/rooms) · `besedka-infra` (rusqlite bundled + refinery) · `besedka-app` (axum + бинарник).
@@ -84,16 +85,36 @@ _Обновлено: 2026-10-30 · Source of truth «где мы»._
 - **Гейты:** `cargo test --workspace` — **170 passed / 0 failed** (app 69, core 12, infra 89; +4 новых: `list_users` + HTTP `GET /users`) · `cargo clippy --all-targets -- -D warnings` — **0** · `cargo fmt --check` — чистый · `npm run check` (svelte-check) — **0 errors** · `npm run build` (vite) — **OK** · живой браузер: сценарий выше пройден.
 - **Commit:** (см. ниже) — `feat(chat): Wave 2.2 — room chat UI (post + list + pagination + live polling) + users catalog`, pushed в origin/main.
 
+## Wave 2.3 — что сделано (принято)
+- **INFRA:** миграция `V5__edit_reads.sql` — `messages.edited_at`/`deleted_at` (nullable) + таблица `message_readers(message_id, reader_id, first_read_at, PK(message_id,reader_id))` + индексы. Методы: `edit_message`/`delete_message` (только автор, иначе Forbidden), `record_read` (курсор: сдвиг `last_read_id`, если новое; `changes()==0` → no-op), `message_readers` (дедуп по читавшему, время = первое прочтение), `unread_count` (`max(id) > last_read_id`).
+- **CORE:** типы `Message { edited_at, deleted_at }` + `ReadReceipt`; те же доменные правила (автор-гейты, 1–4096 trim).
+- **APP (HTTP):**
+  - `PATCH /api/v1/rooms/{id}/messages/{mid}` — `{text}`; не автор → 403; нет/удалено → 404; пустой/длинный → 400 → 200 + сообщение.
+  - `DELETE /api/v1/rooms/{id}/messages/{mid}` — только автор → **204 без тела**; чужое → 403.
+  - `POST /api/v1/rooms/{id}/read` (пустое тело) → `{last_read_id}`; не участник → 403.
+  - `GET /api/v1/rooms/{id}/messages/{mid}/readers` → `[{reader_id, reader_name, read_at}]`.
+  - `GET /rooms/{id}/messages?after_id=` — «новее id» (поллинг не тащит старые страницы).
+  - `JsonOrEmpty` — 200/201 с телом, 204 без тела (исправлен баг «204 с пустым JSON ломал клиента»).
+- **UI:** `api.ts` + `RoomChat.svelte` — инлайн-редактирование (Enter/Сохранить → PATCH + бейдж «(изменено)», Esc/Отмена без запроса); двухклик-удаление («🗑 Удалить» → «⚠ Точно?», авто-сброс 3 с); read receipts «✓ N» + раскрываемый «Прочитали: …»; отметка прочтения при открытии комнаты и при новых сообщениях (только видимая вкладка); live-поллинг теперь через `after_id`.
+- **Тесты:** 177 passed / 0 failed (app 71, core 12, infra 94; новые: автор-гейты edit/delete, курсор read, дедуп readers, unread_count, HTTP PATCH/DELETE/204/403/404/400, `after_id`).
+- **Гейты:** `cargo fmt --check` чистый · `cargo clippy -- -D warnings` — 0 · `cargo test --workspace` — **177 passed** · `npm run check` — **0 errors** · `npm run build` — **OK**.
+- **Живой браузер:** alice/bob/carol в `obshchii` — read receipts (✓1→✓2, «Прочитали: alice, bob»), редактирование с «(изменено)», двухклик-удаление (сообщение исчезло + в API пусто), bob (не автор) → 403, carol (не участник) → 403. Скриншоты: `.conveyor/screenshots/23-*.png`.
+- **Отчёт:** `.conveyor/reports/wave23-report.md`.
+- **Commit:** `a97e1ed` — `feat(chat): Wave 2.3 — edit/delete own messages + read receipts`, pushed в origin/main.
+
 ## Дальше
 **WAVE 1 (аутентификация + комнаты) — ✅ ПОЛНОСТЬЮ ЗАВЕРШЕНА** (2026-10-27):
 1. **1.1 ✅** register/login/logout/me (argon2) + сессии + `users`/`roles` в core.
 2. **1.2 ✅** AD/Kerberos SSO (`GET /auth_ad_sso`, `POST /auth_ad_login`, status, admin-диагностика) + mock-режим + ролевые гейты.
 3. **1.3 ✅** список комнат + join/leave + ролевые гейты (app + ui).
 
-**WAVE 2 (сообщения) — начата:**
+**WAVE 2 (сообщения) — ✅ ПОЛНОСТЬЮ ЗАВЕРШЕНА** (2026-10-31):
 1. **2.1 ✅** Каналы + сообщения (append) в БД (core + infra + API) — см. секцию выше (коммит `89b7b39`).
 2. **2.2 ✅** Чат в UI: пост + список + пагинация + live (поллинг) + каталог `GET /users` — см. секцию выше (2026-10-30).
-3. **2.3 →** [app+ui] Edit/delete своего сообщения + read receipts. (поэтому в 2.1 полей `edited_at`/`deleted_by` нет).
+3. **2.3 ✅** Edit/delete своего сообщения + read receipts — см. секцию выше (2026-10-31, коммит `a97e1ed`).
+
+**WAVE 3 (файлы) — следующая:**
+1. **3.1 →** [app+ui] Файлы в сообщениях (картинки): upload/serve/preview + UI-вложения. Промпт: `PROMPT_wave24.md`.
 
 ## Указатели контекста
 - Конвенции/стек/роли: `CONVENTIONS.md`
