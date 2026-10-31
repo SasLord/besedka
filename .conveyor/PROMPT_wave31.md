@@ -79,7 +79,7 @@
    hermes send -t telegram --subject "Besedka Wave 3.1 ✅ (файлы: upload/download)" --file .conveyor/reports/wave31-report.md
    (отчёт — в `.conveyor/reports/wave31-report.md`, формат как wave23-report.md)
 
-10. **ОБЯЗАТЕЛЬНО (правило конвейера):** написать `.conveyor/PROMPT_wave25.md` для следующего среза — **Wave 3.2 [ui]: Превью файлов в чате (image/PDF)** (Accept из PLAN.md 3.2: картинка инлайн, PDF-ссылка). Смысл: привязка file↔message (новая колонка/таблица, если надо), кнопка «📎» в RoomChat (drag&drop — бонус), инлайн-картинка (клик → полный размер), PDF — ссылка-превью, в списке сообщений. Формат — как PROMPT_wave23.md / PROMPT_wave24.md: что уже сделано (включая 3.1), шаги, гейты, commit, STATE.md, Telegram, и шаг «написать PROMPT_wave26.md» (4.1 поиск FTS5). Закоммитить и запушить.
+10. **ОБЯЗАТЕЛЬНО (правило конвейера):** написать `.conveyor/PROMPT_wave32.md` для следующего среза — **Wave 3.2 [ui]: Превью файлов в чате (image/PDF)** (Accept из PLAN.md 3.2: картинка инлайн, PDF-ссылка). Смысл: привязка file↔message (новая колонка/таблица, если надо), кнопка «📎» в RoomChat (drag&drop — бонус), инлайн-картинка (клик → полный размер), PDF — ссылка-превью, в списке сообщений. Формат — как PROMPT_wave23.md / PROMPT_wave31.md: что уже сделано (включая 3.1), шаги, гейты, commit, STATE.md, Telegram, и шаг «написать PROMPT_wave41.md» (4.1 поиск FTS5). Закоммитить и запушить.
 
 11. Перед завершением: **остановить все фоновые процессы** (API-сервер, vite, cargo-джобы) — не оставлять висящие.
 
