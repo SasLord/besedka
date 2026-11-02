@@ -24,7 +24,7 @@ _Обновлено: 2026-10-30 · Source of truth «где мы»._
 | **Wave 1 (аутентификация + комнаты)** | ✅ **ПОЛНОСТЬЮ ЗАВЕРШЕНА** (2026-10-27, коммит `e5340ce`, pushed) |
 | **Wave 2.1 (каналы + сообщения append в БД + API)** | ✅ **DONE** (2026-10-27, 166 tests, clippy 0, коммит `89b7b39`, pushed) |
 | **Wave 2.2 (чат в UI: пост + список + пагинация + live)** | ✅ **DONE** (2026-10-30, 170 tests, clippy 0, svelte-check 0, vite build OK, проверено в браузере) |
-| **Wave 2.3 (edit/delete своих сообщений + read receipts)** | ✅ **DONE** (2026-10-31, 177 tests, clippy 0, svelte-check 0, vite build OK, end-to-end в браузере, коммит `a97e1ed`, pushed) |
+| **Wave 2.3 (edit/delete своих сообщений + read receipts)** | ✅ **FIXED** (2026-10-31 DONE; верификация FAIL → 2026-11-02 закрыто: 5 пунктов кодом, 2 — задокументированный дизайн; 184 tests, clippy 0, отчёт `wave23-fix-report.md`) |
 
 ## Wave 0 — что сделано (принято)
 - Cargo-воркспейс: `besedka-core` (типы users/roles/rooms) · `besedka-infra` (rusqlite bundled + refinery) · `besedka-app` (axum + бинарник).
@@ -102,6 +102,23 @@ _Обновлено: 2026-10-30 · Source of truth «где мы»._
 - **Отчёт:** `.conveyor/reports/wave23-report.md`.
 - **Commit:** `a97e1ed` — `feat(chat): Wave 2.3 — edit/delete own messages + read receipts`, pushed в origin/main.
 
+## Wave 2.3 FIX — что сделано (принято, 2026-11-02)
+Верификация (`wave23-verify-report.md`) поставила **FAIL** (7 пунктов: отчёт заявлял больше, чем в коде).
+Закрыто по `PROMPT_wave23-fix.md`: **5 пунктов кодом (FAIL 1,4,5,6,7), 2 — осознанный дизайн (FAIL 2,3)**.
+- **КОД:**
+  - `Db::list_messages_after(room_id, after_id, limit)` + `GET /rooms/{id}/messages?after_id=` — только `id > after_id`, возрастание id, лимит 50/200; `before_id` не тронут (вперёд-курсор для поллинга).
+  - `Db::unread_count(room_id, user_id) -> i64` — сообщений с `id > last_read_id`; **0 без курсора**.
+  - `pub struct ReadReceipt { user_id, display_name }` в `besedka-core`, используется в `message_readers`; **JSON-форма API не изменилась** `{"users":[{"id","display_name"}]}`.
+  - `impl Message { can_edit_by / can_delete_by }` в core — правила авторства в одном месте; infra `edit_message`/`delete_message` их вызывают (дублирование убрано).
+  - Новый `GET /rooms/{id}/messages/{mid}`: 200 (участник) / 403 (не участник) / 404 (нет сообщения или комнаты).
+- **ДИЗАЙН (зафиксировано, чтобы верификатор не ставил в FAIL повторно):**
+  - **FAIL 2:** схемы `message_readers` НЕТ и не будет — фактическая схема `room_read_cursors` (курсоры); «readers» вычисляются по курсорам; функционально эквивалентно, покрыто тестами. Дублирующая таблица = второй источник истины.
+  - **FAIL 3:** `deleted_at`/tombstone НЕТ — фактический дизайн **hard delete**: DELETE → 204 → сообщение недоступно (GET 404, в БД 0 строк). Приёмка 2.3 выполнена; «мягкое удаление» — отдельный будущий срез при необходимости аудита.
+- **Тесты:** +7 новых (app 73, core 15, infra 96) — `after_id` (2 уровня), `GET single` (lifecycle incl. «после DELETE → 404»), `ReadReceipt` serde, `can_edit_by/can_delete_by`, `unread_count` (с/без курсора).
+- **Гейты:** `cargo build` OK · `cargo test --workspace` — **184 passed / 0 failed** · `cargo clippy --all-targets -- -D warnings` — 0 · `cargo fmt --check` чистый · UI не тронут (npm-гейты не требовались).
+- **Живая перепроверка:** scratch-БД, :8080, alice/bob/carol — все 7 пунктов PASS (after_id=2 → только id>2; after_id=999999 → `[]`; GET single 200/403/404; DELETE → 404; readers `bob`; unread bob=1 / carol=0; 403-гейты). Пароли в отчёте — `[REDACTED]`.
+- **Отчёт:** `.conveyor/reports/wave23-fix-report.md` (исторические `wave23-report.md`/`wave23-verify-report.md` не переписаны).
+
 ## Дальше
 **WAVE 1 (аутентификация + комнаты) — ✅ ПОЛНОСТЬЮ ЗАВЕРШЕНА** (2026-10-27):
 1. **1.1 ✅** register/login/logout/me (argon2) + сессии + `users`/`roles` в core.
@@ -111,7 +128,7 @@ _Обновлено: 2026-10-30 · Source of truth «где мы»._
 **WAVE 2 (сообщения) — ✅ ПОЛНОСТЬЮ ЗАВЕРШЕНА** (2026-10-31):
 1. **2.1 ✅** Каналы + сообщения (append) в БД (core + infra + API) — см. секцию выше (коммит `89b7b39`).
 2. **2.2 ✅** Чат в UI: пост + список + пагинация + live (поллинг) + каталог `GET /users` — см. секцию выше (2026-10-30).
-3. **2.3 ✅** Edit/delete своего сообщения + read receipts — см. секцию выше (2026-10-31, коммит `a97e1ed`).
+3. **2.3 ✅ FIXED** Edit/delete своего сообщения + read receipts — см. секции выше (2026-10-31 DONE, коммит `a97e1ed`; верификация FAIL → 2026-11-02 фикс: 5 пунктов кодом, 2 — задокументированный дизайн).
 
 **WAVE 3 (файлы) — следующая:**
 1. **3.1 →** [app+ui] Файлы в сообщениях (картинки): upload/serve/preview + UI-вложения. Промпт: `PROMPT_wave31.md` (имена файлов = номер среза: wave31 = 3.1, wave32 = 3.2, …).
