@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use besedka_core::{Message, Role, Room, RoomKind, User};
+use besedka_core::{Message, ReadReceipt, Role, Room, RoomKind, User};
 use refinery::embed_migrations;
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -423,6 +423,38 @@ impl Db {
         Ok(page)
     }
 
+    /// Forward pagination: messages **newer** than `after_id`
+    /// (`id > after_id`), ascending, capped at `limit`.
+    ///
+    /// This is the polling counterpart of [`list_messages`]: the client keeps
+    /// the newest message id it already has, passes it as `after_id`, and gets
+    /// exactly the new messages. The returned page is always in ASCENDING
+    /// order (oldest → newest), ready to render top-to-bottom.
+    ///
+    /// `limit` is expected to be 1..=200 (the app layer enforces this with
+    /// HTTP 400 and defaults to 50); the DB clamps defensively
+    /// (0 → 1, >200 → 200).
+    pub fn list_messages_after(
+        &self,
+        room_id: i64,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<Message>, DbError> {
+        let limit = limit.clamp(1, 200);
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, room_id, sender_id, text, created_at, edited_at
+             FROM messages
+             WHERE room_id = ?1 AND id > ?2
+             ORDER BY id ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![room_id, after_id, limit as i64], message_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Edit a message's text and stamp `edited_at`. The timestamp is
     /// generated in SQL with the SAME `strftime` expression as the
     /// `created_at` column default (`%Y-%m-%dT%H:%M:%fZ` — RFC 3339 UTC with
@@ -508,13 +540,14 @@ impl Db {
     }
 
     /// Who has read a given message: room members whose cursor is at or past
-    /// the message id, as `(user_id, display_name)` pairs sorted by name
-    /// (`display_name` falls back to `username`, same as the user catalog).
+    /// the message id. Returns one [`ReadReceipt`] per reader
+    /// (`user_id` + `display_name`), sorted by name (`display_name` falls
+    /// back to `username`, same as the user catalog).
     pub fn message_readers(
         &self,
         room_id: i64,
         message_id: i64,
-    ) -> Result<Vec<(i64, String)>, DbError> {
+    ) -> Result<Vec<ReadReceipt>, DbError> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT u.id, COALESCE(u.display_name, u.username)
@@ -525,9 +558,34 @@ impl Db {
              ORDER BY COALESCE(u.display_name, u.username)",
         )?;
         let rows = stmt
-            .query_map((room_id, message_id), |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map((room_id, message_id), |row| {
+                Ok(ReadReceipt {
+                    user_id: row.get(0)?,
+                    display_name: row.get(1)?,
+                })
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// How many messages in the room the user has NOT read yet: messages
+    /// with `id > last_read_id`.
+    ///
+    /// Returns `0` when the user has no read cursor yet (never opened the
+    /// room) — per the Wave 2.3 design, an absent cursor means "not started
+    /// reading", so nothing counts as unread.
+    pub fn unread_count(&self, room_id: i64, user_id: i64) -> Result<i64, DbError> {
+        let cursor = match self.get_read_cursor(room_id, user_id)? {
+            Some(c) => c,
+            None => return Ok(0),
+        };
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE room_id = ?1 AND id > ?2",
+            (room_id, cursor),
+            |row| row.get(0),
+        )?;
+        Ok(count)
     }
 }
 
@@ -994,7 +1052,13 @@ mod tests {
         // Bob read up to m1: sees m1, not m2.
         db.set_read_cursor(room, bob, m1).unwrap();
         let readers = db.message_readers(room, m1).unwrap();
-        assert_eq!(readers, vec![(bob, "Bob".to_string())]);
+        assert_eq!(
+            readers,
+            vec![ReadReceipt {
+                user_id: bob,
+                display_name: "Bob".to_string()
+            }]
+        );
         assert!(db.message_readers(room, m2).unwrap().is_empty());
 
         // Carol read up to m2 → she has read BOTH m1 and m2. Bob only read
@@ -1002,17 +1066,81 @@ mod tests {
         db.set_read_cursor(room, carol, m2).unwrap();
         assert_eq!(
             db.message_readers(room, m2).unwrap(),
-            vec![(carol, "Carol".to_string())]
+            vec![ReadReceipt {
+                user_id: carol,
+                display_name: "Carol".to_string()
+            }]
         );
         assert_eq!(
             db.message_readers(room, m1).unwrap(),
-            vec![(bob, "Bob".to_string()), (carol, "Carol".to_string())]
+            vec![
+                ReadReceipt {
+                    user_id: bob,
+                    display_name: "Bob".to_string()
+                },
+                ReadReceipt {
+                    user_id: carol,
+                    display_name: "Carol".to_string()
+                }
+            ]
         );
 
         // A non-member who somehow has a cursor is excluded by the join.
         let outsider = db.create_user("outsider", None, Role::User, None).unwrap();
         db.set_read_cursor(room, outsider, 999).unwrap();
         assert_eq!(db.message_readers(room, m2).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unread_count_tracks_messages_past_the_cursor() {
+        let db = Db::open_in_memory().unwrap();
+        let alice = db
+            .create_user("alice", Some("Alice"), Role::User, None)
+            .unwrap();
+        let room = db.create_room(RoomKind::Channel, "#dev").unwrap();
+        db.join_room(room, alice).unwrap();
+
+        let m1 = db.create_message(room, alice, "one").unwrap();
+        let _m2 = db.create_message(room, alice, "two").unwrap();
+        let m3 = db.create_message(room, alice, "three").unwrap();
+
+        // No cursor yet → nothing to count.
+        assert_eq!(db.unread_count(room, alice).unwrap(), 0);
+
+        // Read up to m1 → m2 and m3 are unread.
+        db.set_read_cursor(room, alice, m1).unwrap();
+        assert_eq!(db.unread_count(room, alice).unwrap(), 2);
+
+        // Read up to m3 → everything is read.
+        db.set_read_cursor(room, alice, m3).unwrap();
+        assert_eq!(db.unread_count(room, alice).unwrap(), 0);
+    }
+
+    #[test]
+    fn list_messages_after_returns_only_newer_in_ascending_order() {
+        let db = Db::open_in_memory().unwrap();
+        let alice = db
+            .create_user("alice", Some("Alice"), Role::User, None)
+            .unwrap();
+        let room = db.create_room(RoomKind::Channel, "#dev").unwrap();
+        db.join_room(room, alice).unwrap();
+
+        let m1 = db.create_message(room, alice, "one").unwrap();
+        let m2 = db.create_message(room, alice, "two").unwrap();
+        let m3 = db.create_message(room, alice, "three").unwrap();
+
+        // Nothing after m3 (it is the newest).
+        assert!(db.list_messages_after(room, m3, 50).unwrap().is_empty());
+
+        // After m1 → m2, m3 (ascending), m1 excluded.
+        let page = db.list_messages_after(room, m1, 50).unwrap();
+        let ids: Vec<i64> = page.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![m2, m3]);
+
+        // Limit respected: after m1, limit 1 → only m2.
+        let page = db.list_messages_after(room, m1, 1).unwrap();
+        let ids: Vec<i64> = page.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![m2]);
     }
 
     #[test]

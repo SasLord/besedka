@@ -15,7 +15,7 @@ pub mod room;
 pub mod user;
 
 pub use ad::{AdClient, AdDirectory, AuthOutcome, DirectoryError, DirectoryResult};
-pub use message::Message;
+pub use message::{Message, ReadReceipt};
 pub use password::{hash, verify};
 pub use role::Role;
 pub use room::{Room, RoomKind};

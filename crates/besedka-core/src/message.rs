@@ -31,6 +31,40 @@ pub struct Message {
     pub edited_at: Option<String>,
 }
 
+/// A read receipt: which user read a message, plus that user's display name.
+///
+/// Wave 2.3: the readers endpoint builds one of these per member whose read
+/// cursor is at or past the message. The wire format keeps the field names
+/// `id`/`display_name` (mapped in the app layer), so this struct is the
+/// domain representation of a receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadReceipt {
+    /// The user who read the message.
+    pub user_id: i64,
+    /// That user's display name (joined from the users table).
+    pub display_name: String,
+}
+
+impl Message {
+    /// Whether the user `actor_id` may edit this message.
+    ///
+    /// Only the author (`sender_id`) may edit their own message — everyone
+    /// else, including room members, is denied. This is the single source of
+    /// truth for the edit policy; the infra/app layers call it instead of
+    /// duplicating the check.
+    pub fn can_edit_by(&self, actor_id: i64) -> bool {
+        self.sender_id == actor_id
+    }
+
+    /// Whether the user `actor_id` may delete this message.
+    ///
+    /// Only the author (`sender_id`) may delete their own message. Single
+    /// source of truth for the delete policy.
+    pub fn can_delete_by(&self, actor_id: i64) -> bool {
+        self.sender_id == actor_id
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,5 +86,32 @@ mod tests {
         let json = serde_json::to_string(&m).expect("serialize");
         let back: Message = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn read_receipt_serde_roundtrip() {
+        let r = ReadReceipt {
+            user_id: 7,
+            display_name: "Анна".into(),
+        };
+        let json = serde_json::to_string(&r).expect("serialize");
+        let back: ReadReceipt = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(r, back);
+    }
+
+    #[test]
+    fn can_edit_by_author_only() {
+        let m = sample(); // sender_id = 3
+        assert!(m.can_edit_by(3), "the author may edit");
+        assert!(!m.can_edit_by(4), "a stranger may not edit");
+        assert!(!m.can_edit_by(1), "another member may not edit");
+    }
+
+    #[test]
+    fn can_delete_by_author_only() {
+        let m = sample(); // sender_id = 3
+        assert!(m.can_delete_by(3), "the author may delete");
+        assert!(!m.can_delete_by(4), "a stranger may not delete");
+        assert!(!m.can_delete_by(1), "another member may not delete");
     }
 }
