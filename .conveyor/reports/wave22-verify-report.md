@@ -107,4 +107,4 @@ $ curl -s -w '\n%{http_code}\n' -b jar_bob.txt http://127.0.0.1:8080/api/v1/user
 
 ## Telegram
 
-(заполняется после попытки отправки)
+**Telegram: не доставлено (сеть).** `hermes send -t telegram …` — 2 попытки (первичная + 1 повтор), обе: `Timed out` (сеть к `api.telegram.org` закрыта). По чек-листу это не считается FAIL.
