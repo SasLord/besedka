@@ -14,7 +14,7 @@ pub mod http;
 
 use std::sync::Arc;
 
-use axum::routing::{get, patch, post};
+use axum::routing::{get, post};
 use axum::Router;
 use besedka_infra::Db;
 use time::Duration;
@@ -64,10 +64,13 @@ pub fn app(db: Arc<Db>, sessions: SessionsConfig, ad: AdRuntime) -> Router {
             post(http::post_message).get(http::list_messages),
         )
         // Wave 2.3 — edit (PATCH) and delete (DELETE) a message: authors only.
-        // Any other method on this path is answered 405 by the router.
+        // Wave 2.3 fix (FAIL 7) adds GET on the same path: fetch one message
+        // by id. Any other method on this path is answered 405 by the router.
         .route(
             "/api/v1/rooms/{id}/messages/{message_id}",
-            patch(http::edit_message).delete(http::delete_message),
+            get(http::get_message)
+                .patch(http::edit_message)
+                .delete(http::delete_message),
         )
         // Wave 2.3 — read receipts: mark the room read (members) and the
         // per-message reader list (members).
@@ -1355,7 +1358,14 @@ mod tests {
         )
         .await;
 
-        for qs in ["limit=0", "limit=201", "before_id=0", "before_id=-1"] {
+        for qs in [
+            "limit=0",
+            "limit=201",
+            "before_id=0",
+            "before_id=-1",
+            "after_id=0",
+            "after_id=-1",
+        ] {
             let (status, _, _) = req(
                 &router,
                 "GET",
@@ -1366,6 +1376,184 @@ mod tests {
             .await;
             assert_eq!(status, 400, "query '{qs}' must be rejected");
         }
+    }
+
+    // ----- Wave 2.3 fix (FAIL 1): forward cursor `after_id` (polling) -----
+
+    #[tokio::test]
+    async fn list_messages_after_id_returns_only_newer_ascending() {
+        let db = test_db();
+        let room_id = db.create_room(RoomKind::Channel, "lenta").expect("room");
+        let router = test_app(db);
+        let cookie = logged_in(&router, "alice").await;
+        req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/join"),
+            None,
+            Some(&cookie),
+        )
+        .await;
+
+        let mut ids = Vec::new();
+        for text in ["pervyi", "vtoroi", "tretii"] {
+            let (status, body, _) = req(
+                &router,
+                "POST",
+                &format!("/api/v1/rooms/{room_id}/messages"),
+                Some(serde_json::json!({ "text": text })),
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, 201);
+            ids.push(body["message"]["id"].as_i64().unwrap());
+        }
+
+        // after_id = the second message → only the third one (id > after_id).
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages?after_id={}", ids[1]),
+            None,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 200, "body: {body}");
+        let got: Vec<i64> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(got, vec![ids[2]]);
+
+        // after_id = the first message → the two newer ones, ascending.
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages?after_id={}", ids[0]),
+            None,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 200, "body: {body}");
+        let got: Vec<i64> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(got, vec![ids[1], ids[2]]);
+
+        // after_id past the newest → empty list (polling found nothing new).
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages?after_id=999999"),
+            None,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, 200, "body: {body}");
+        assert_eq!(body["messages"], serde_json::json!([]));
+    }
+
+    // ----- Wave 2.3 fix (FAIL 7): GET one message by id -----
+
+    #[tokio::test]
+    async fn get_single_message_by_id_membership_and_lifecycle() {
+        let db = test_db();
+        let room_id = db.create_room(RoomKind::Channel, "obshchii").expect("room");
+        let router = test_app(db);
+
+        let author = logged_in(&router, "author").await;
+        // Logged in, but never joins the room.
+        let stranger = logged_in(&router, "stranger").await;
+        req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/join"),
+            None,
+            Some(&author),
+        )
+        .await;
+
+        let (status, body, _) = req(
+            &router,
+            "POST",
+            &format!("/api/v1/rooms/{room_id}/messages"),
+            Some(serde_json::json!({ "text": "privet" })),
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 201);
+        let mid = body["message"]["id"].as_i64().unwrap();
+
+        // Member → 200 with the message payload.
+        let (status, body, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages/{mid}"),
+            None,
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 200, "body: {body}");
+        assert_eq!(body["message"]["id"], mid);
+        assert_eq!(body["message"]["text"], "privet");
+
+        // Non-member → 403 (checked before the message lookup).
+        let (status, _, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages/{mid}"),
+            None,
+            Some(&stranger),
+        )
+        .await;
+        assert_eq!(status, 403);
+
+        // Unknown message in an existing room → 404.
+        let (status, _, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages/999999"),
+            None,
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 404);
+
+        // Unknown room → 404.
+        let (status, _, _) = req(
+            &router,
+            "GET",
+            "/api/v1/rooms/999999/messages/1",
+            None,
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 404);
+
+        // Lifecycle: DELETE (204) → the same GET is now 404.
+        let (status, _, _) = req(
+            &router,
+            "DELETE",
+            &format!("/api/v1/rooms/{room_id}/messages/{mid}"),
+            None,
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (status, _, _) = req(
+            &router,
+            "GET",
+            &format!("/api/v1/rooms/{room_id}/messages/{mid}"),
+            None,
+            Some(&author),
+        )
+        .await;
+        assert_eq!(status, 404, "after DELETE the message must be gone");
     }
 
     // ----- Wave 2.2: user catalog (GET /api/v1/users) -----

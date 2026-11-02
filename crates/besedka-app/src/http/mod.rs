@@ -14,7 +14,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use besedka_core::{Message, Room, RoomKind, User};
+use besedka_core::{Message, ReadReceipt, Room, RoomKind, User};
 use besedka_infra::{DbError, RoomView};
 use serde::Serialize;
 use thiserror::Error;
@@ -172,14 +172,19 @@ pub struct MessagesResponse {
 
 /// `GET /rooms/{id}/messages` query params:
 /// - `limit` — page size, 1..=200 (default 50);
-/// - `before_id` — cursor: return the page immediately before this message id
-///   (oldest page of all when absent).
+/// - `before_id` — backward cursor: return the page immediately before this
+///   message id (the oldest page of all when absent). Kept as-is.
+/// - `after_id` — forward cursor (polling): return only messages with
+///   `id > after_id`, in ascending order. When present, `before_id` is
+///   ignored (the two cursors are mutually exclusive).
 #[derive(Debug, serde::Deserialize)]
 pub struct ListMessagesQuery {
     #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
     before_id: Option<i64>,
+    #[serde(default)]
+    after_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -495,13 +500,18 @@ pub async fn post_message(
     Ok((StatusCode::CREATED, Json(MessageResponse { message })))
 }
 
-/// `GET /api/v1/rooms/{id}/messages` — the latest page of a room's messages
+/// `GET /api/v1/rooms/{id}/messages` — a page of a room's messages
 /// (members only).
 ///
-/// Query: `limit` (1..=200, default 50; 400 otherwise) and `before_id`
-/// (cursor — the page immediately before this message id; absent = the
-/// newest `limit`). The page comes back in ASCENDING order (oldest →
-/// newest), ready to render top-to-bottom.
+/// Query:
+/// - `limit` (1..=200, default 50; 400 otherwise);
+/// - `before_id` (backward cursor — the page immediately before this message
+///   id; absent = the newest `limit`);
+/// - `after_id` (forward cursor for polling — only messages with
+///   `id > after_id`, ascending; takes precedence when both are given).
+///
+/// The page comes back in ASCENDING order (oldest → newest), ready to render
+/// top-to-bottom.
 pub async fn list_messages(
     State(state): State<AppState>,
     AuthedUser(user): AuthedUser,
@@ -517,10 +527,16 @@ pub async fn list_messages(
             "before_id must be a positive message id",
         ));
     }
+    if matches!(query.after_id, Some(id) if id <= 0) {
+        return Err(HttpError::bad_request(
+            "after_id must be a positive message id",
+        ));
+    }
 
     let db = state.db.clone();
     let user_id = user.id;
     let before_id = query.before_id;
+    let after_id = query.after_id;
     let messages = tokio::task::spawn_blocking(move || {
         // Unknown room -> 404; non-member -> 403 (DbError::Forbidden).
         if db.get_room(room_id)?.is_none() {
@@ -529,7 +545,13 @@ pub async fn list_messages(
         if !db.is_room_member(room_id, user_id)? {
             return Err(DbError::Forbidden);
         }
-        db.list_messages(room_id, limit, before_id)
+        // Forward cursor (polling) takes precedence when present: only the
+        // newer messages (id > after_id), ascending. Otherwise fall back to
+        // the backward `before_id` page, unchanged.
+        match after_id {
+            Some(after) => db.list_messages_after(room_id, after, limit),
+            None => db.list_messages(room_id, limit, before_id),
+        }
     })
     .await
     .map_err(|e| HttpError::internal(format!("background task failed: {e}")))?;
@@ -573,9 +595,11 @@ pub async fn edit_message(
         if !db.is_room_member(room_id, user_id)? {
             return Err(DbError::Forbidden.into());
         }
-        // Author-only: a member who did NOT write this message gets 403.
+        // Author-only: the policy lives on core `Message` (single source of
+        // truth), the app layer just calls it. A member who did NOT write
+        // this message gets 403.
         let existing = db.get_message(message_id)?.ok_or(DbError::NotFound)?;
-        if existing.sender_id != user_id {
+        if !existing.can_edit_by(user_id) {
             return Err(HttpError::forbidden("you can only edit your own messages"));
         }
         db.update_message_text(message_id, &text)?;
@@ -608,9 +632,11 @@ pub async fn delete_message(
         if !db.is_room_member(room_id, user_id)? {
             return Err(DbError::Forbidden.into());
         }
-        // Author-only: a member who did NOT write this message gets 403.
+        // Author-only: the policy lives on core `Message` (single source of
+        // truth), the app layer just calls it. A member who did NOT write
+        // this message gets 403.
         let existing = db.get_message(message_id)?.ok_or(DbError::NotFound)?;
-        if existing.sender_id != user_id {
+        if !existing.can_delete_by(user_id) {
             return Err(HttpError::forbidden(
                 "you can only delete your own messages",
             ));
@@ -622,6 +648,37 @@ pub async fn delete_message(
     .map_err(|e| HttpError::internal(format!("background task failed: {e}")))?;
     deleted?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ----- Wave 2.3 fix (FAIL 7): single message by id -----
+
+/// `GET /api/v1/rooms/{id}/messages/{message_id}` — fetch one message by id
+/// (members only).
+///
+/// 404 when the room or the message does not exist, 403 for non-members
+/// (the membership check runs before the message lookup so a stranger can't
+/// probe message ids across rooms). After a `DELETE` the row is gone, so
+/// this same endpoint returns 404 — which is how the UI confirms a deletion.
+pub async fn get_message(
+    State(state): State<AppState>,
+    AuthedUser(user): AuthedUser,
+    Path((room_id, message_id)): Path<(i64, i64)>,
+) -> Result<Json<MessageResponse>, HttpError> {
+    let db = state.db.clone();
+    let user_id = user.id;
+    let message = tokio::task::spawn_blocking(move || {
+        // Unknown room -> 404; non-member -> 403 (DbError::Forbidden).
+        if db.get_room(room_id)?.is_none() {
+            return Err(DbError::NotFound);
+        }
+        if !db.is_room_member(room_id, user_id)? {
+            return Err(DbError::Forbidden);
+        }
+        db.get_message(message_id)?.ok_or(DbError::NotFound)
+    })
+    .await
+    .map_err(|e| HttpError::internal(format!("background task failed: {e}")))?;
+    Ok(Json(MessageResponse { message: message? }))
 }
 
 // ----- Wave 2.3: read receipts (room read cursors) -----
@@ -664,8 +721,9 @@ pub async fn mark_read(
 /// `GET /api/v1/rooms/{id}/messages/{message_id}/readers` — who has read a
 /// message (members only).
 ///
-/// Room members whose read cursor is at or past the message id, as
-/// `{"users":[{"id","display_name"},...]}` (same shape as `/api/v1/users`).
+/// Room members whose read cursor is at or past the message id. The data
+/// arrives as core `ReadReceipt` rows; the wire shape is unchanged:
+/// `{"users":[{"id","display_name"},...]}` (same as `/api/v1/users`).
 pub async fn message_readers(
     State(state): State<AppState>,
     AuthedUser(user): AuthedUser,
@@ -673,7 +731,7 @@ pub async fn message_readers(
 ) -> Result<Json<UsersResponse>, HttpError> {
     let db = state.db.clone();
     let user_id = user.id;
-    let inner = tokio::task::spawn_blocking(move || -> Result<Vec<(i64, String)>, HttpError> {
+    let inner = tokio::task::spawn_blocking(move || -> Result<Vec<ReadReceipt>, HttpError> {
         // Unknown room -> 404; non-member -> 403 (checked before the message
         // so a stranger can't probe message ids across rooms).
         if db.get_room(room_id)?.is_none() {
@@ -693,7 +751,10 @@ pub async fn message_readers(
     Ok(Json(UsersResponse {
         users: readers
             .into_iter()
-            .map(|(id, display_name)| UserDto { id, display_name })
+            .map(|r| UserDto {
+                id: r.user_id,
+                display_name: r.display_name,
+            })
             .collect(),
     }))
 }
