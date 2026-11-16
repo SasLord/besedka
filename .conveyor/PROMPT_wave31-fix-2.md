@@ -41,13 +41,10 @@ export type File = {
 - `hermes send -t telegram --subject "Besedka Wave 3.1 ✅ (fix: файлы upload/download)" --file .conveyor/reports/wave31-report.md`
   (таймаут доставки — повторить 1 раз; всё равно не ушло → зафиксировать в отчёте, это НЕ FAIL).
 
-### 5. PROMPT_wave32.md (ОБЯЗАТЕЛЬНО)
-Написать `.conveyor/PROMPT_wave32.md` — **Wave 3.2 [ui]: Превью файлов в чате (image/PDF)** (Accept из PLAN.md 3.2: картинка инлайн, PDF-ссылка): привязка file↔message (колонка/таблица — решить по PLAN.md), кнопка «📎» в RoomChat, drag&drop (бонус), инлайн-картинка (клик → полный размер), PDF — ссылка; опираться на готовый API 3.1 (POST/GET `/api/v1/files`, `uploadFile`/`fileUrl` из api.ts). Формат — как `PROMPT_wave31.md`/`PROMPT_wave23.md` (сделано, шаги, гейты, commit, STATE, Telegram, шаг «написать PROMPT_wave41.md» — 4.1 поиск FTS5).
+### 5. Финальные коммиты
+- отчёт + скриншот: `docs(conveyor): Wave 3.1 report + screenshot 31-file-preview` → `git push origin main`.
 
-### 6. Финальные коммиты
-- отчёт + скриншот + PROMPT_wave32: `docs(conveyor): Wave 3.1 report + screenshots + PROMPT_wave32 (3.2 UI preview)` → `git push origin main`.
-
-### 7. Перед завершением
+### 6. Перед завершением
 - **остановить все фоновые процессы** (API-сервер, vite, cargo-джобы) — не оставлять висящие;
 - финальный отчёт в чате: UI-гейты, живое превью (скриншот), STATE, Telegram (status), коммиты.
 

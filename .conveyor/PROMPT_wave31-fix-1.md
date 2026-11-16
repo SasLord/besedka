@@ -4,7 +4,7 @@
 === ЗАДАЧА: Исправить Wave 3.1 (файлы: upload/download) — ЧАСТЬ 1/2: БЭКЕНД ===
 Верификация (`wave31-verify-report.md`) завершилась **FAIL**: core/infra сделаны и зелёные, но **воркспейс не компилируется** (`E0433: cannot find 'files' in 'http'`), HTTP-слой 3.1 отсутствует. Отчёт: **`.conveyor/reports/wave31-verify-report.md`** — прочитай ВПЕРВЫХ, это источник правды. Исходная спека: `.conveyor/PROMPT_wave31.md` (статус-коды, тексты ошибок, RFC 5987, PITFALLы — оттуда).
 
-**Граница части 1: ТОЛЬКО бэкенд (Rust).** UI (`ui/`) НЕ трогать, браузер НЕ поднимать, STATE/отчёт/PROMPT_wave32 — НЕ писать. Это всё **ЧАСТЬ 2/2** (`.conveyor/PROMPT_wave31-fix-2.md`) — твоя работа заканчивается зелёным бэкендом + commit + push + стоп фоновых процессов.
+**Граница части 1: ТОЛЬКО бэкенд (Rust).** UI (`ui/`) НЕ трогать, браузер НЕ поднимать, STATE/отчёт НЕ писать (Telegram не слать). Это всё **ЧАСТЬ 2/2** (`.conveyor/PROMPT_wave31-fix-2.md`) — твоя работа заканчивается зелёным бэкендом + commit + push + стоп фоновых процессов.
 
 ## Что УЖЕ есть и НЕ ТРОГАТЬ (проверено, зелёное):
 - `crates/besedka-core/src/file.rs` — тип `File`, `MAX_FILE_SIZE_DEFAULT` (25 MiB), `ALLOWED_CONTENT_TYPES`, `validate_upload(size_bytes, max_size_bytes, content_type)`, `sanitize_filename`, 13 тестов. **Единственная правка:** убрать `#[serde(rename_all = "camelCase")]` с `File` (проект — snake_case: Message/User/Room).
@@ -64,6 +64,6 @@
 ### 6. Завершение части 1
 - commit: `fix(files): Wave 3.1 part 1 — HTTP upload/download layer, config dir, snake_case wire, WIP cleanup` → `git push origin main`.
 - **Остановить все фоновые процессы** (API-сервер, cargo-джобы) — не оставлять висящие.
-- Короткий отчёт в чате: что сделано, гейты, живые curl-статусы, номера тестов. **Не** STATE.md, **не** Telegram, **не** PROMPT_wave32 — ждём часть 2.
+- Короткий отчёт в чате: что сделано, гейты, живые curl-статусы, номера тестов. **Не** STATE.md, **не** Telegram — ждём часть 2.
 
 Начни с чтения контекста (CONVENTIONS/STATE/PLAN/отчёт верификации/PROMPT_wave31/перечисленные файлы), потом пиши код одним проходом, не перечитывай files, которые уже записал (write_file верифицирует).
